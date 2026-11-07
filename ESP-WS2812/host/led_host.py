@@ -570,10 +570,11 @@ RENDER_FULL_PEAK = 1.00      # 满档对应的输出峰值（--render-full-peak 
 # 放歌是「PWM 域」亮度系数：封面色必须**先逐通道过 gamma** 再乘它，
 # 否则等于把感知颜色直接当 PWM 发出去，亮通道拉满、暗通道也被抬起 → 泛白过曝。
 # 0.37 让白色封面最亮约 94/255，正好等于旧封面呼吸的 gamma(255×0.70)=93。
-# 亮度从 0 线性起步，**不做最低亮度保底平台**：声音极小时第一颗就该接近熄灭，
-# 亮度随音量连续变化而不是先跳到一个固定亮度。
-# 数字输出没有底噪，所以也不套麦克风的声音门限，颗数至少 1 颗。
+# 亮度从 RENDER_BRIGHT_FLOOR=0.01 线性爬升到 0.37：1% 是**曲线的起点**，
+# 不是「低音量段固定不变」的保底平台 —— 后者才会被看成「声音很小灯却很亮」。
+# 这里全程随 lv 连续变化。数字输出没有底噪，也不套麦克风声音门限，颗数至少 1 颗。
 RENDER_BRIGHT_MAX = 0.37
+RENDER_BRIGHT_FLOOR = 0.01
 
 # WASAPI 设备峰值表接口。IID 后四位是 D008E73E0064 —— 网上常见的
 # D01E1FE83D21C 是错的，Activate 会直接回 0x80004002 E_NOINTERFACE。
@@ -878,13 +879,15 @@ def mic_brightness(level):
 
 
 def render_brightness(level):
-    """放歌用的 PWM 域亮度系数：从 0 线性上升到 RENDER_BRIGHT_MAX。
+    """放歌用的 PWM 域亮度系数：从 RENDER_BRIGHT_FLOOR(1%) 线性升到 RENDER_BRIGHT_MAX。
 
-    故意不复用 VU 的亮度曲线、也不做最低亮度保底 —— 那条曲线低段被压得很暗，
-    加保底又会形成「小音量却固定很亮」的平台。这里让第一颗灯从 0% 开始，
-    随音量连续爬升。media 帧和终端面板共用；调用方必须先把封面色过 gamma。
+    1% 是**起点**而不是「低音量段固定不变」的保底平台 —— 后者会让人觉得
+    声音很小灯却很亮。这里全程随 lv 连续变化。
+    故意不复用 VU 的亮度曲线（那条低段被压得过暗）。media 帧和终端面板共用；
+    调用方必须先把封面色过 gamma。
     """
-    return RENDER_BRIGHT_MAX * max(0.0, min(1.0, level))
+    lv = max(0.0, min(1.0, level))
+    return RENDER_BRIGHT_FLOOR + (RENDER_BRIGHT_MAX - RENDER_BRIGHT_FLOOR) * lv
 
 
 def mic_leds(in_use, level=0.0, reverse=False):
@@ -1310,7 +1313,7 @@ class LedStrip:
         """raw=True：rgb_list 已是最终 PWM 值（0~255），直接发，绕过 gamma 与 max_level。
 
         声音驱动灯效（放歌封面灯 / 麦克风 VU）必须用这个模式：它们给的
-        0%~37% / 1%~80% 是「最终占空比」，过一遍 gamma 会把 1% 压成 0/255、
+        1%~37% / 1%~80% 是「最终占空比」，过一遍 gamma 会把 1% 压成 0/255、
         10% 压成约 0.4/255，肉眼全黑。降级封面呼吸用默认 False，
         走 gamma + 70% 上限；待机全灭走哪条都一样。
         """
@@ -1513,7 +1516,7 @@ class Monitor:
             # 过完 gamma，最亮的白色封面约 94/255，与旧封面呼吸的最亮帧一致。
             lv = self.render_level.value
             gamma_base = [apply_gamma(c) for c in base]
-            n = 1.0 + lv * (LED_COUNT - 1)   # 颗数不做门限；亮度另由 render_brightness 从 0 起步
+            n = 1.0 + lv * (LED_COUNT - 1)   # 颗数不做门限；亮度另由 render_brightness 从 1% 起步
             bright = render_brightness(lv)
             self._raw_frame = True          # gamma_base 已是 PWM 值，不能再过一次 gamma
             out = [(0, 0, 0)] * LED_COUNT
@@ -2241,7 +2244,8 @@ def run_monitor(strip: LedStrip, app_filter=None, cover_layout="spatial",
     else:
         print(f"          没在播放 -> 静音 {MEDIA_FALLBACK_DELAY:g}s 后熄灯")
     print(f"          降级呼吸走 gamma + {strip.max_level:.0%} 上限（--max-level）；"
-          f"声音驱动灯效按最终 PWM 直出（放歌 0%~{RENDER_BRIGHT_MAX:.0%} / VU 80%）；"
+          f"声音驱动灯效按最终 PWM 直出（放歌 {RENDER_BRIGHT_FLOOR:.0%}~"
+          f"{RENDER_BRIGHT_MAX:.0%} / VU 80%）；"
           f"固件侧 --brightness {strip.brightness}")
     if status_led:
         print("          板载 LED(GPIO2/D4)：未占用=灭 / 占用=常亮；"
