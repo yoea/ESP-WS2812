@@ -22,7 +22,8 @@ LastUsedTimeStart / LastUsedTimeStop），带去抖滤掉输入法那种几十�
 
 降级路径的封面呼吸受 MAX_LEVEL = 0.70（--max-level）限制，在 gamma 之前乘到每颗灯上。
 两种声音驱动灯效是例外：亮度按「最终 PWM 占空比」直出（1% 过 gamma 会全黑），
-放歌峰值 60%、麦克风 VU 峰值 80%。固件侧 --brightness 默认满档，一般别动。
+放歌先把封面色过 gamma 再乘亮度（最亮白色封面约 94/255，与旧封面呼吸一致），
+VU 峰值 80%。固件侧 --brightness 默认满档，一般别动。
 
 板载 LED（GPIO2 / D4）现在兼两职：
     常驻状态 —— 麦克风没占用 = 熄灭（待机静默）；麦克风占用 = 常亮
@@ -566,11 +567,12 @@ MIC_SMOOTH_TAU = 0.035       # 声音驱动灯效的颜色平滑；全局 0.15s 
 # eCapture 换成 eRender），不开捕获流、不碰 ConsentStore、戴耳机也照样有值。
 RENDER_NOISE_FLOOR = 0.0     # 数字输出没有底噪，静音就是 0
 RENDER_FULL_PEAK = 1.00      # 满档对应的输出峰值（--render-full-peak 可调）
-# 封面配色可能是白色/浅色，8 颗全亮时电流比 VU 的饱和单色高，
-# 所以在 VU 亮度曲线上再乘一道安全系数：峰值 80% × 0.75 = 60% PWM。
-RENDER_BRIGHT_CAP = 0.75
-# 数字输出没有底噪，不能套麦克风的声音门限（0.02），否则小音量直接 0 颗全灭。
-# 放歌时至少亮 1 颗，并保一个肉眼可见的最低亮度（5% 最终 PWM，约 13/255）。
+# 放歌是「PWM 域」亮度系数：封面色必须**先逐通道过 gamma** 再乘它，
+# 否则等于把感知颜色直接当 PWM 发出去，亮通道拉满、暗通道也被抬起 → 泛白过曝。
+# 0.37 让白色封面最亮约 94/255，正好等于旧封面呼吸的 gamma(255×0.70)=93。
+# 0.05 是小音量保底（约 13/255，肉眼可见）；数字输出没有底噪，
+# 所以不套麦克风的声音门限，小音量也至少亮 1 颗。
+RENDER_BRIGHT_MAX = 0.37
 RENDER_MIN_LEVEL = 0.05
 
 # WASAPI 设备峰值表接口。IID 后四位是 D008E73E0064 —— 网上常见的
@@ -875,6 +877,17 @@ def mic_brightness(level):
     return MIC_BRIGHT_STOPS[-1][1]
 
 
+def render_brightness(level):
+    """放歌用的 PWM 域亮度系数（RENDER_MIN_LEVEL ~ RENDER_BRIGHT_MAX）。
+
+    把 VU 亮度曲线归一化到 0~1 再线性映射；media 帧和终端面板共用，
+    避免两处算出不同的数字。调用方必须把封面色先过 gamma 再乘这个系数。
+    """
+    lv = max(0.0, min(1.0, level))
+    norm = mic_brightness(max(lv, MIC_SOUND_GATE)) / MIC_BRIGHT_STOPS[-1][1]
+    return RENDER_MIN_LEVEL + (RENDER_BRIGHT_MAX - RENDER_MIN_LEVEL) * norm
+
+
 def mic_leds(in_use, level=0.0, reverse=False):
     """麦克风态的 8 颗颜色（**已经是最终 PWM 值**，调用方要按 raw 直出）。
 
@@ -1093,7 +1106,7 @@ class Display:
         if st == "media" and rm and rm.available:
             lv = mon.render_level.value
             L.append(self._row(f"输出 {mic_led_count(lv):.1f}/{LED_COUNT} 颗  "
-                               f"亮度 {mic_brightness(lv) * RENDER_BRIGHT_CAP:.0%}  "
+                               f"亮度 {render_brightness(lv):.0%}  "
                                f"峰值 {mon.render_level.peak:.3f}"))
         if frame:
             L.append(self._row("灯珠 " + "".join(bg(c, "  ") for c in frame)))
@@ -1160,9 +1173,9 @@ FRAME_INTERVAL = 1.0 / FRAME_HZ
 DEFAULT_BRIGHTNESS = 255
 # host 侧输出上限（0~1），在 gamma 之前乘到每颗灯上 —— 降级封面呼吸受它限制。
 # 两种声音驱动灯效是例外：亮度按最终 PWM 占空比直出
-# （见 MIC_BRIGHT_STOPS / RENDER_BRIGHT_CAP / set_all(raw=True)），
-# 放歌峰值 60%、VU 峰值 80%；放歌用的是封面色（可能偏白），所以额外压了一道
-# RENDER_BRIGHT_CAP，避免 8 颗全白把 USB 500mA 打穿。
+# （见 MIC_BRIGHT_STOPS / render_brightness / set_all(raw=True)）。
+# 放歌先把封面色过 gamma（避免泛白过曝），最亮白色封面约 94/255，
+# 与旧封面呼吸相当；VU 峰值 80%（饱和单色，电流仍低于 8 颗全白）。
 # 70% 感知亮度对应 PWM gamma(178)=93，8 颗约 173mA，加板子约 250mA，离 USB 500mA 还有余量。
 MAX_LEVEL = 0.70
 
@@ -1296,7 +1309,7 @@ class LedStrip:
         """raw=True：rgb_list 已是最终 PWM 值（0~255），直接发，绕过 gamma 与 max_level。
 
         声音驱动灯效（放歌封面灯 / 麦克风 VU）必须用这个模式：它们给的
-        1%~60% / 1%~80% 是「最终占空比」，过一遍 gamma 会把 1% 压成 0/255、
+        5%~37% / 1%~80% 是「最终占空比」，过一遍 gamma 会把 1% 压成 0/255、
         10% 压成约 0.4/255，肉眼全黑。降级封面呼吸用默认 False，
         走 gamma + 70% 上限；待机全灭走哪条都一样。
         """
@@ -1494,15 +1507,14 @@ class Monitor:
                 return [scale(c, level) for c in base]
 
             # 声音驱动：颜色仍是这 8 颗封面配色，亮几颗 / 多亮交给系统输出峰值。
-            # 与 VU 共用映射，只是把「绿->红」换成每颗自己的封面色，并压一道安全系数。
+            # 封面色先逐通道过 gamma 转成 PWM 域 —— 这一步不能省：
+            # 直接拿感知 RGB 乘系数再 raw 直出会过曝泛白（亮暗通道一起被抬起来）。
+            # 过完 gamma，最亮的白色封面约 94/255，与旧封面呼吸的最亮帧一致。
             lv = self.render_level.value
-            # 数字输出没有底噪：不套麦克风的声音门限，哪怕很小声也至少亮 1 颗。
-            # mic_brightness 在低段连 1% 都不到（WS2812 基本不发光），
-            # 所以再保一个可见的最低亮度；VU 那两条曲线本身不动。
-            n = 1.0 + lv * (LED_COUNT - 1)
-            bright = max(RENDER_MIN_LEVEL,
-                         mic_brightness(max(lv, MIC_SOUND_GATE)) * RENDER_BRIGHT_CAP)
-            self._raw_frame = True          # 5%~60% 是最终 PWM，不能再过 gamma
+            gamma_base = [apply_gamma(c) for c in base]
+            n = 1.0 + lv * (LED_COUNT - 1)   # 不套麦克风门限，小音量也至少 1 颗
+            bright = render_brightness(lv)
+            self._raw_frame = True          # gamma_base 已是 PWM 值，不能再过一次 gamma
             out = [(0, 0, 0)] * LED_COUNT
             whole, frac = int(n), n - int(n)
             for i, idx in enumerate(mic_order(self.mic_reverse)):
@@ -1511,7 +1523,7 @@ class Monitor:
                 # 只有「已经亮了 2 颗以上、正在长出下一颗」才做小数渐入；
                 # 只剩 1 颗时不能把它自己削暗，否则小音量会忽明忽暗。
                 fade = frac if (whole >= 2 and i == whole - 1 and frac > 0.06) else 1.0
-                out[idx] = scale(base[idx], bright * fade)
+                out[idx] = scale(gamma_base[idx], bright * fade)
             return out
 
         return [(0, 0, 0)] * LED_COUNT
@@ -2228,7 +2240,7 @@ def run_monitor(strip: LedStrip, app_filter=None, cover_layout="spatial",
     else:
         print(f"          没在播放 -> 静音 {MEDIA_FALLBACK_DELAY:g}s 后熄灯")
     print(f"          降级呼吸走 gamma + {strip.max_level:.0%} 上限（--max-level）；"
-          f"声音驱动灯效按最终 PWM 直出（放歌峰值 {RENDER_BRIGHT_CAP * 0.8:.0%} / VU 80%）；"
+          f"声音驱动灯效按最终 PWM 直出（放歌 5%~{RENDER_BRIGHT_MAX:.0%} / VU 80%）；"
           f"固件侧 --brightness {strip.brightness}")
     if status_led:
         print("          板载 LED(GPIO2/D4)：未占用=灭 / 占用=常亮；"
