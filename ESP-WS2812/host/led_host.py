@@ -2048,15 +2048,33 @@ def calibrate_mic(seconds=5.0):
     print("前提：先让一个应用占着麦克风（系统录音机 / 语音输入法 / 会议软件都行），"
           "否则设备峰值恒为 0。")
     t0 = time.time()
-    peak_max, n = 0.0, 0
+    samples = []
     while time.time() - t0 < seconds:
-        peak_max = max(peak_max, m.read())
-        n += 1
+        samples.append(m.read())
         time.sleep(FRAME_INTERVAL)
-    print(f"采样 {n} 次，正常说话最大 peak = {peak_max:.4f}"
+    if not samples:
+        print("采样时间太短，没有取到样本。")
+        return
+    n = len(samples)
+    peak_max = max(samples)
+    peak_avg = sum(samples) / n
+    clip_ratio = sum(1 for p in samples if p >= 0.995) / n
+    print(f"采样 {n} 次：最大 {peak_max:.4f} / 平均 {peak_avg:.4f}"
+          f" / 顶到 1.0 的帧占 {clip_ratio:.0%}"
           f"   （当前满档量程 {MIC_FULL_PEAK:g}）")
     if peak_max <= MIC_NOISE_FLOOR * 2:
         print("没捕到声音：确认有应用正在用麦克风，然后重跑一次。")
+        return
+    if clip_ratio >= 0.10 or peak_max >= 0.995:
+        print()
+        print("[!] 检测到削波：peak 顶到 1.0，这个信号已经没有动态范围。")
+        print("    --mic-full-peak 已经是物理上限 1.00，调小只会更早满档，改软件没用。")
+        print("    请从信号源头降增益：")
+        print("    1) 控制面板 → 声音 → 录制 → 麦克风 → 级别：把「麦克风」调低，")
+        print("       「麦克风加强 / Microphone Boost」设为 0dB 或关掉；")
+        print("    2) 关掉录音 / 会议 / 语音软件里的「自动增益控制 AGC」；")
+        print("    3) 麦克风离嘴 15~20cm（贴嘴说话本来就容易打满）。")
+        print("    调完重跑本命令，目标是正常说话 peak 落在 0.3~0.6、削波占比接近 0%。")
         return
     suggest = min(1.0, max(0.05, (peak_max - MIC_NOISE_FLOOR) / 0.55))
     print(f"想让这个音量落在约 4~5 颗：--mic-full-peak {suggest:.2f}")
