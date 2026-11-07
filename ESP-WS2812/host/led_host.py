@@ -6,10 +6,10 @@
 两件事，按优先级：
   1. 有音乐在播 —— 认出系统里正在播放的音乐，把专辑封面的配色铺到 8 颗灯珠上，
      整条灯带跟着一个缓慢的呼吸节奏明暗起伏。
-  2. 没在播音乐 —— 麦克风没被占用：**灯带全灭**，改由板载 LED 以 1Hz 亮灭表示待机；
+  2. 没在播音乐 —— 麦克风没被占用：**灯带全灭、板载 LED 也灭**，完全静默；
      正在被占用：板载 LED 常亮，音量同时决定亮几颗（1~8，从最近端往最远端）、
-     颜色（绿 -> 黄 -> 橙 -> 红）和亮度（1% -> 95% 最终 PWM 占空比）；
-     没声音或声音极低时一颗都不亮。
+     颜色（绿 -> 黄 -> 橙 -> 红）和亮度（1% -> 80% 最终 PWM 占空比）；
+     lv=1.0 才刚好亮满 8 颗，没声音或声音极低时一颗都不亮。
 
 「谁在用」读 Windows 隐私同意记录（ConsentStore 下 microphone 键的
 LastUsedTimeStart / LastUsedTimeStop），带去抖滤掉输入法那种几十毫秒的短脉冲；
@@ -19,10 +19,10 @@ LastUsedTimeStart / LastUsedTimeStop），带去抖滤掉输入法那种几十�
 
 封面呼吸受 MAX_LEVEL = 0.70（--max-level）限制，在 gamma 之前乘到每颗灯上。
 电平表是例外：亮度按「最终 PWM 占空比」直出（1%/10% 过 gamma 会全黑），
-自己的曲线最高 95%。固件侧 --brightness 默认满档，一般别动。
+自己的曲线最高 80%。固件侧 --brightness 默认满档，一般别动。
 
 板载 LED（GPIO2 / D4）现在兼两职：
-    常驻状态 —— 麦克风没占用 = 1Hz 亮灭（待机）；麦克风占用 = 常亮
+    常驻状态 —— 麦克风没占用 = 熄灭（待机静默）；麦克风占用 = 常亮
     事件脉冲 —— 切歌闪 2 下 / 灯效状态切换闪 3 下（脉冲优先，闪完回到常驻状态）
 主机失联（关机 / 拔 USB / 后台服务崩）由固件自己判断：3 秒没数据又没收到 OFF
 就转成温柔呼吸（PWM 渐亮渐暗，2.6s 一个来回）—— 那时候串口已经断了，
@@ -54,7 +54,8 @@ LastUsedTimeStart / LastUsedTimeStop），带去抖滤掉输入法那种几十�
     --breathe-depth 0.40     呼吸幅度 0~1，越大明暗差别越明显
     --no-mic                 关掉麦克风指示，没播音乐就熄灯
     --mic-reverse            翻转电平条点亮方向（默认从离板子最近的灯开始）
-    --mic-full-peak 0.35     电平表满档对应的设备峰值（普通音量就满档则调大）
+    --mic-full-peak 1.00     电平表满档对应的设备峰值（默认吃满 0~1 量程）
+    --mic-calibrate          采样 5 秒设备峰值，帮你校准 --mic-full-peak
     --no-status-led          不用板载 LED(GPIO2/D4)做状态指示和事件提示
     --no-ui                  不画终端面板（后台运行时自动生效）
     --background             后台模式：静默运行 + 日志写 logs/led_host.log（自启时用）
@@ -530,18 +531,16 @@ MIC_ORDER = list(range(LED_COUNT))                        # [0,1,...,7] 近 -> �
 MIC_ORDER_REVERSED = list(range(LED_COUNT - 1, -1, -1))   # [7,...,0] 远 -> 近
 
 # ---- 音量 -> 亮灯颗数 / 亮度 ----
-# 三维表达：颗数 1->8、颜色 绿->红、亮度 1%->95%（最终 PWM 占空比）。
-# 电平 lv 是 MicLevel 归一化后的 0~1，不把 1.0 直接当成「8 颗满亮」：
-# 前 0.70 用来长颗数，剩下 0.70~1.00 专供「8 颗已全亮之后继续加亮」。
+# 颗数和亮度都跟着归一化电平 lv 一路走到 1.0 才满档，让 8 颗灯尽量覆盖整个电平范围：
+#   lv < 0.02  -> 0 颗全灭（没声音）
+#   lv = 0.10  -> 约 1.7 颗 / 1% 最终 PWM 占空比
+#   lv = 1.00  -> 8 颗 / 80% 最终 PWM 占空比
 # 亮度必须按最终占空比直出，不能过 gamma：gamma(0.1)≈0.4/255，10% 会肉眼全黑。
 MIC_SOUND_GATE = 0.02        # 低于此 = 没声音/极低声：**一颗都不亮**
-MIC_VU_LED_START = 0.12      # 这之前只有 1 颗，先把亮度从 1% 抬到 10%
-MIC_VU_FULL = 0.70           # 到这点刚好长满 8 颗，此时亮度 60%
 MIC_BRIGHT_STOPS = (         # (电平, 最终 PWM 占空比)，分段线性、单调递增
-    (MIC_SOUND_GATE, 0.01), # 刚过声音门限：1 颗、1%
-    (0.12, 0.10),           # 稍微有声：还是 1 颗，亮到 10%
-    (0.70, 0.60),           # 8 颗刚全亮：60%
-    (1.00, 0.95),           # 最大声：95%
+    (0.00, 0.00),
+    (0.10, 0.01),           # 低电平很暗：1%
+    (1.00, 0.80),           # 最大声 80%，不再冲到 95%
 )
 
 # ---- 电平归一化：固定量程（别再用「历史最大峰值」当满档） ----
@@ -549,16 +548,13 @@ MIC_BRIGHT_STOPS = (         # (电平, 最终 PWM 占空比)，分段线性、�
 # target=(peak-floor)/(ref-floor)=1.0 —— 任何正常说话都会直接算成满档 8 颗。
 # 现在量程固定不动：peak 从噪声门限线性映射到 MIC_FULL_PEAK，声音大就是大、
 # 声音小就是小，不会「自己把量程撑大」。
-# 麦克风增益因机器而异，用 --mic-full-peak 校准；--diagnose 会打印当前 peak。
+# 麦克风增益因机器而异，用 --mic-calibrate 实测峰值、--mic-full-peak 校准。
 MIC_NOISE_FLOOR = 0.006      # 实测安静底噪 0.0066~0.0105，低于此不算有声
-MIC_FULL_PEAK = 0.35         # 满档对应的设备峰值（默认，可用 --mic-full-peak 改）
+# 默认吃满 WASAPI peak 的整个 0~1 物理范围：贴嘴说话不再一下打满。
+# 旧默认 0.35 只用了 1/3 量程，再叠加「lv>=0.70 就 8 颗」，实际 peak≈0.25 就到顶。
+MIC_FULL_PEAK = 1.00         # 满档对应的设备峰值（默认，可用 --mic-full-peak 改）
 MIC_LEVEL_TAU = 0.035        # 电平快平滑（50Hz 下约 2 帧），波形跟手但不抖
 MIC_SMOOTH_TAU = 0.035       # mic 态专用的颜色平滑；全局 0.15s 会把波形削平
-
-# 待机（麦克风未占用）：灯带全灭，板载 LED 以 1Hz 亮灭；麦克风一激活就常亮。
-# 固件 mode 2 (STATUS_BLINK) 是 0.5Hz，达不到 1Hz，所以由 host 每半秒切 0/1；
-# set_status_led 自带缓存，只在状态翻转时发一条，串口每秒多 2 帧而已。
-STATUS_BLINK_HZ = 1.0
 
 # WASAPI 设备峰值表接口。IID 后四位是 D008E73E0064 —— 网上常见的
 # D01E1FE83D21C 是错的，Activate 会直接回 0x80004002 E_NOINTERFACE。
@@ -830,20 +826,20 @@ def mic_hue(i):
 def mic_led_count(level):
     """电平 -> 亮起颗数（0 或 1.0~8.0，含小数）。
 
-    低于 MIC_SOUND_GATE 直接 0 颗（没声音就全灭）；0.70 时长满 8 颗，之后固定 8 颗。
+    低于 MIC_SOUND_GATE 直接 0 颗（没声音就全灭）；之后按 1 + lv×7 线性长，
+    **lv=1.0 才刚好 8 颗**，让 8 颗灯覆盖整个电平范围而不是提前到顶。
     """
     lv = max(0.0, min(1.0, level))
     if lv < MIC_SOUND_GATE:
         return 0.0
-    t = (lv - MIC_VU_LED_START) / max(1e-6, MIC_VU_FULL - MIC_VU_LED_START)
-    return 1.0 + max(0.0, min(1.0, t)) * (LED_COUNT - 1)
+    return 1.0 + lv * (LED_COUNT - 1)
 
 
 def mic_brightness(level):
     """电平 -> 最终 PWM 占空比（0~1）。按 MIC_BRIGHT_STOPS 分段线性插值。
 
-    注意这是「占空比」不是「感知亮度」：1%/10%/60%/95% 是灯珠实际发出来的比例，
-    必须绕过 gamma，否则低段全被压成 0。声音门限以下直接 0（不亮）。
+    注意这是「占空比」不是「感知亮度」：lv=0.1 的 1% 到 lv=1.0 的 80% 是灯珠
+    实际发出来的比例，必须绕过 gamma，否则低段全被压成 0。门限以下直接 0。
     """
     lv = max(0.0, min(1.0, level))
     if lv < MIC_SOUND_GATE:
@@ -858,7 +854,7 @@ def mic_brightness(level):
 def mic_leds(in_use, level=0.0, reverse=False):
     """麦克风态的 8 颗颜色（**已经是最终 PWM 值**，调用方要按 raw 直出）。
 
-    in_use=False -> 全灭（待机：灯带不亮，板载 LED 接管状态指示）。
+    in_use=False -> 全灭（待机：灯带与板载 LED 都灭，完全静默）。
     in_use=True  -> 音量同时决定亮几颗、什么颜色、多亮；
                     低于 MIC_SOUND_GATE 一颗都不亮，只有真有声音才亮起来。
     """
@@ -1039,7 +1035,7 @@ class Display:
                 tag = (f"电平 {mic_led_count(lv):.1f}/{LED_COUNT} · "
                        f"亮度 {mic_brightness(lv):>3.0%} · 峰值 {mon.level.peak:.3f}")
             else:
-                tag = "待机 · 灯带全灭 / 板载 1Hz 闪"
+                tag = "待机 · 全静默（灯带与板载都灭）"
             line = f"麦克风 {bg(col, '  ')} {tag}"
             if busy and mon.mic.apps:
                 who = "、".join(mon.mic.apps[:2])
@@ -1111,7 +1107,7 @@ CMD_SET_ALL, CMD_BRIGHTNESS, CMD_HEARTBEAT, CMD_OFF, CMD_HANDSHAKE = 0x01, 0x03,
 CMD_STATUS_LED = 0x07
 CMD_STATUS_PULSE = 0x08
 # 板载 LED（GPIO2 / D4）的常驻灯态，取值必须跟固件里的 STATUS_* 一致。
-# 现在用 OFF / ON 由 host 拼出 1Hz 闪烁与常亮；固件的 BLINK(2) 是 0.5Hz，不用。
+# 现在只用 OFF（待机静默）/ ON（麦克风在用）；固件 BLINK(2) 不用。
 # 事件脉冲走 0x08，失联呼吸由固件自己接管。
 STATUS_LED_OFF, STATUS_LED_ON, STATUS_LED_BLINK = 0, 1, 2
 # 事件提示：闪几下。"切歌"和"状态切换"给不同的下数，不用看屏幕就知道刚发生了什么。
@@ -1134,7 +1130,7 @@ FRAME_INTERVAL = 1.0 / FRAME_HZ
 DEFAULT_BRIGHTNESS = 255
 # host 侧输出上限（0~1），在 gamma 之前乘到每颗灯上 —— 封面呼吸受它限制。
 # 电平表是例外：亮度按最终 PWM 占空比直出（见 MIC_BRIGHT_STOPS / set_all(raw=True)），
-# 峰值 95%，但用的是饱和单色而非全白，8 颗电流仍低于「8 颗全白满亮」的情形。
+# 峰值 80%，且用的是饱和单色而非全白，8 颗电流仍低于「8 颗全白满亮」的情形。
 # 70% 感知亮度对应 PWM gamma(178)=93，8 颗约 173mA，加板子约 250mA，离 USB 500mA 还有余量。
 MAX_LEVEL = 0.70
 
@@ -1267,7 +1263,7 @@ class LedStrip:
     def set_all(self, rgb_list, raw=False):
         """raw=True：rgb_list 已是最终 PWM 值（0~255），直接发，绕过 gamma 与 max_level。
 
-        电平表必须用这个模式：它给的 1%/10%/60%/95% 是「最终占空比」，
+        电平表必须用这个模式：它给的 1%~80% 是「最终占空比」，
         过一遍 gamma 会把 1% 压成 0/255、10% 压成约 0.4/255，肉眼全黑。
         封面呼吸用默认 False，走 gamma + 70% 上限；待机全灭走哪条都一样。
         """
@@ -1367,7 +1363,7 @@ class Monitor:
     """
     三个状态，优先级从高到低：
       media  正在播放 -> 铺封面配色，整条灯带同步呼吸
-      mic    没在播放 -> 麦克风没占用=灯带全灭+板载 1Hz 闪 / 正在录音=按音量亮 1~8 颗
+      mic    没在播放 -> 麦克风没占用=灯带全灭+板载也灭 / 正在录音=按音量亮 1~8 颗
       idle   没在播放且麦克风检测不可用 -> 熄灭（只有非 Windows 才会落到这）
 
     切歌/暂停不立刻熄灯，留 MEDIA_FALLBACK_DELAY 的缓冲，避免空档闪灭。
@@ -1387,7 +1383,7 @@ class Monitor:
         self._pulse_guard_until = 0.0     # 脉冲冷却到期时刻，防止连按「下一首」闪成一片
         self._note = "灭 · 静默"          # 面板「板载」那一行：事件文案
         self._note_until = 0.0
-        self._status_note = f"闪 {STATUS_BLINK_HZ:g}Hz · 待机"   # 常驻状态文案
+        self._status_note = "灭 · 待机静默"   # 常驻状态文案
 
         self.media = MediaWatcher(app_filter)
         self.mic = MicWatcher() if mic else None
@@ -1443,11 +1439,11 @@ class Monitor:
         if self.state == "mic":
             busy = self.mic.in_use
             if busy:
-                # 电平接口挂了就退回二值指示：亮满 8 颗 + 95% 亮度，仍看得出「在用」
+                # 电平接口挂了就退回二值指示：亮满 8 颗 + 80% 亮度，仍看得出「在用」
                 lv = self.level.value if (self.meter and self.meter.available) else 1.0
                 self._raw_frame = True       # mic_leds 已按最终 PWM 算好亮度，别再过 gamma
                 return mic_leds(True, lv, self.mic_reverse)
-            # 没被占用：灯带全灭；板载 LED 用 1Hz 闪烁表达待机（见 _status_led_tick）
+            # 没被占用：灯带全灭；板载 LED 也熄灭，完全静默（见 _status_led_tick）
             return mic_leds(False)
 
         if self.state == "media" and self.media.color:
@@ -1497,14 +1493,9 @@ class Monitor:
 
         常驻状态每帧算一次，靠 set_status_led 的缓存去重（值不变一个字节都不发）：
           麦克风在用   -> 常亮（STATUS_LED_ON）
-          麦克风没在用 -> 1Hz 亮灭，每半秒在 ON / OFF 之间翻一次
-        为什么不用固件的 STATUS_BLINK(2)：那是 1s 亮 / 1s 灭 = 0.5Hz，达不到
-        要求的 1Hz；又不想为这个重烧固件，所以由 host 自己按半秒切 0/1。
-        代价只是每秒多 2 帧命令，串口 50Hz 的主流量面前可以忽略。
-
+          麦克风没在用 -> 静默熄灭（STATUS_LED_OFF），不做任何闪烁
         事件脉冲（切歌 2 下 / 状态切换 3 下）照旧发 0x08：固件里 pulse 优先于
-        常驻灯态，闪完自动回到常亮或闪烁，两者不打架。
-        电平档位变化故意不触发脉冲，否则 50Hz 下会变成频闪灯。
+        常驻灯态，闪完自动回到常亮或熄灭。电平档位变化不发脉冲，否则会频闪。
 
         （主机失联的温柔呼吸仍由固件在 3 秒无数据后自己接管。）
         """
@@ -1512,17 +1503,12 @@ class Monitor:
         track = self._track_key()
 
         # 1) 常驻状态：只表达「麦克风有没有被占用」，与放不放歌无关
-        if self.mic is None:              # --no-mic：没有占用检测，板载灯也别乱闪
-            strip.set_status_led(STATUS_LED_OFF)
-            self._status_note = "灭 · 未启用麦克风检测"
-        elif self.mic.in_use:
+        if self.mic is not None and self.mic.in_use:
             strip.set_status_led(STATUS_LED_ON)
             self._status_note = "常亮 · 麦克风在用"
         else:
-            period = 1.0 / STATUS_BLINK_HZ
-            lit = (now % period) < (period / 2.0)
-            strip.set_status_led(STATUS_LED_ON if lit else STATUS_LED_OFF)
-            self._status_note = f"闪 {STATUS_BLINK_HZ:g}Hz · 待机"
+            strip.set_status_led(STATUS_LED_OFF)
+            self._status_note = "灭 · 待机静默"
 
         # 2) 事件脉冲
         times, note = 0, ""
@@ -2036,17 +2022,45 @@ def diagnose_mic(full_peak=MIC_FULL_PEAK):
               f"   （无人捕获时恒为 0，安静底噪约 0.007~0.010）")
     print(f"  固定量程：噪声门限 {MIC_NOISE_FLOOR:g} ~ 满档峰值 {full_peak:g}"
           f" / 声音门限 {MIC_SOUND_GATE:g}（低于此一颗都不亮） / 平滑 {MIC_LEVEL_TAU:g}s")
-    print("  校准：用普通音量说话时跑一次，看上面的 peak；"
-          "总是满档就把 --mic-full-peak 调大，几乎不亮就调小")
+    print("  校准：python led_host.py --mic-calibrate（说话 5 秒，直接给建议值）")
     print("  电平预览（近 -> 远，绿 -> 黄 -> 橙 -> 红；色块亮度 = 最终 PWM 占空比）：")
-    for lv in (0.0, 0.02, 0.06, 0.12, 0.30, 0.50, 0.70, 1.0):
+    for lv in (0.0, 0.02, 0.10, 0.30, 0.50, 0.70, 0.90, 1.0):
         cols = mic_leds(True, lv)
         print(f"    {lv:.2f} -> {mic_led_count(lv):.1f} 颗 / "
               f"{mic_brightness(lv):>3.0%}  " + "".join(bg(c, "  ") for c in cols))
-    print(f"  待机：灯带全灭 + 板载 LED {STATUS_BLINK_HZ:g}Hz 闪；"
-          f"麦克风激活时板载 LED 常亮")
+    print("  待机：灯带全灭 + 板载 LED 熄灭；麦克风激活：板载 LED 常亮")
     print(f"  方向：{mic_order(False)}（近 -> 远）；加 --mic-reverse 变成 "
           f"{mic_order(True)}（远 -> 近）")
+
+
+def calibrate_mic(seconds=5.0):
+    """连续采样设备峰值，帮用户按自己麦克风校准 --mic-full-peak。
+
+    GetPeakValue 只在「有应用打开了麦克风捕获流」时才有值（没人录音时恒 0），
+    所以必须让用户一边说话一边跑。脚本自己绝不开捕获流 —— 那会把自己写进
+    ConsentStore，让「麦克风没在使用」永远不成立。
+    """
+    m = MicLevelMeter()
+    if not m.available:
+        print(f"电平接口不可用：{m.error}")
+        return
+    print(f"采样 {seconds:g} 秒 —— 请用【正常音量】对着麦克风说话。")
+    print("前提：先让一个应用占着麦克风（系统录音机 / 语音输入法 / 会议软件都行），"
+          "否则设备峰值恒为 0。")
+    t0 = time.time()
+    peak_max, n = 0.0, 0
+    while time.time() - t0 < seconds:
+        peak_max = max(peak_max, m.read())
+        n += 1
+        time.sleep(FRAME_INTERVAL)
+    print(f"采样 {n} 次，正常说话最大 peak = {peak_max:.4f}"
+          f"   （当前满档量程 {MIC_FULL_PEAK:g}）")
+    if peak_max <= MIC_NOISE_FLOOR * 2:
+        print("没捕到声音：确认有应用正在用麦克风，然后重跑一次。")
+        return
+    suggest = min(1.0, max(0.05, (peak_max - MIC_NOISE_FLOOR) / 0.55))
+    print(f"想让这个音量落在约 4~5 颗：--mic-full-peak {suggest:.2f}")
+    print("想让它更靠后（更不容易满档）就把值调大，上限 1.00；反之调小。")
 
 
 def diagnose(watch=False, full_peak=MIC_FULL_PEAK):
@@ -2081,19 +2095,20 @@ def run_monitor(strip: LedStrip, app_filter=None, cover_layout="spatial",
         print("[monitor] 媒体源不可用（缺 WinRT/Pillow），只会走麦克风指示")
     if mon.mic and mon.mic.available:
         print(f"          没在播放 -> 静音 {MEDIA_FALLBACK_DELAY:g}s 后切过去："
-              f"未占用=灯带全灭+板载 1Hz 闪 / 录音中=颗数+颜色+亮度都跟音量走")
+              f"未占用=灯带全灭+板载也灭 / 录音中=颗数+颜色+亮度都跟音量走")
         if mon.meter and mon.meter.available:
             print(f"          电平 {FRAME_HZ}Hz · 绿->黄->橙->红 · "
                   f"{'远 -> 近' if mic_reverse else '近 -> 远'}（--mic-reverse 可翻转）"
-                  f" · 亮度 1%~95%")
+                  f" · 亮度 1%~80% · lv=1.0 才 8 颗")
             print(f"          固定量程 peak {MIC_NOISE_FLOOR:g}~{mic_full_peak:g}"
-                  f"（--mic-full-peak 校准）· 低于 {MIC_SOUND_GATE:g} 一颗都不亮")
+                  f"（--mic-calibrate 实测 / --mic-full-peak 校准）"
+                  f" · 低于 {MIC_SOUND_GATE:g} 全灭")
     else:
         print(f"          没在播放 -> 静音 {MEDIA_FALLBACK_DELAY:g}s 后熄灯")
     print(f"          封面呼吸亮度上限 {strip.max_level:.0%}（--max-level）；"
           f"电平表按自己的曲线直出，固件侧 --brightness {strip.brightness}")
     if status_led:
-        print(f"          板载 LED(GPIO2/D4)：未占用={STATUS_BLINK_HZ:g}Hz 闪 / 占用=常亮；"
+        print("          板载 LED(GPIO2/D4)：未占用=灭 / 占用=常亮；"
               f"另切歌闪 {PULSE_TRACK} 下 / 状态切换闪 {PULSE_STATE} 下 / 失联温柔呼吸")
     print("          Ctrl+C 退出\n")
 
@@ -2160,12 +2175,12 @@ def main():
     ap.add_argument("--mic-reverse", action="store_true",
                     help="翻转电平条点亮方向（默认从离板子最近的灯开始）")
     ap.add_argument("--mic-full-peak", type=float, default=MIC_FULL_PEAK, metavar="X",
-                    help=f"电平表满档对应的设备峰值 0~1（默认 {MIC_FULL_PEAK:g}）。"
-                         "普通音量就满档就调大，几乎不亮就调小")
+                    help=f"电平表满档对应的设备峰值 0~1（默认 {MIC_FULL_PEAK:g}，"
+                         "已吃满物理范围）。灯几乎不亮才调小；贴嘴就满档请降低系统麦克风增益")
     # 兼容旧的自启任务命令行：老参数等价于 --no-mic，启动不会因为未知参数崩掉
     ap.add_argument("--no-cpu", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--no-status-led", action="store_true",
-                    help="不用板载 LED(GPIO2/D4)做 1Hz/常亮状态指示和事件提示"
+                    help="不用板载 LED(GPIO2/D4)做常亮状态指示和事件提示"
                          "（GPIO2 另有用途时才需要）")
     ap.add_argument("--app-filter", default=None,
                     help="只认某个播放器的媒体会话，例如 cloudmusic.exe")
@@ -2196,6 +2211,9 @@ def main():
     ap.add_argument("--demo", action="store_true", help="灯带自检，不采集任何数据")
     ap.add_argument("--diagnose", action="store_true",
                     help="体检媒体源 + 麦克风占用/电平，不点亮")
+    ap.add_argument("--mic-calibrate", action="store_true",
+                    help="采样 5 秒设备峰值，帮你校准 --mic-full-peak"
+                         "（需先有应用占着麦克风并说话）")
     ap.add_argument("--watch", action="store_true",
                     help="配合 --diagnose 持续刷新，用来观察切歌能否跟上")
     ap.add_argument("--list-ports", action="store_true")
@@ -2211,6 +2229,10 @@ def main():
         print("当前串口：")
         for p in sorted(list_ports.comports()):
             print(f"  {p.device}   {p.description or ''}")
+        return 0
+
+    if args.mic_calibrate:
+        calibrate_mic()
         return 0
 
     if args.diagnose:
