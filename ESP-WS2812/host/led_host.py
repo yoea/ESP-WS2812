@@ -593,12 +593,14 @@ RENDER_BRIGHT_FLOOR = 0.01
 # 真静音（数字输出精确为 0，没有底噪）时一颗都不亮；刚过门限的极小声仍从 1% 起步。
 # 只用来区分「完全没声音」和「有一点声音」，别调大，否则会吞掉小音量段。
 RENDER_SILENCE_GATE = 0.005
-# 极暗封面色过 gamma 后可能只剩 (0,1,4)，再乘低亮度系数会被 int 截断成 (0,0,0)
-# —— 逻辑上点亮了、肉眼却看不见，表现为「第二颗亮、第一颗灭」。
-# 保底强度必须**跟着亮度走**：固定 3/255 会让深色封面从 lv=0 到 1.0 全程锁在
-# 同一个输出（(0,1,4) 的最大通道只有 4，乘 0.37 也到不了 3），又变回固定平台。
-# 所以这里只是「满档时的上限」，实际 floor 由调用方按 bright 缩放。
-RENDER_MIN_GLOW = 3
+# 暗封面色过 gamma 后往往只剩 4~19/255，再乘约 0.35 的亮度系数就只有 3~5/255：
+# 逻辑上点亮了、肉眼却看不见（表现为「前两颗不亮，从第三颗才亮」）。
+# with_glow() 按自身色相比例把最终 PWM 补到这个「最低可见亮度」。
+# 强度必须**跟着亮度走**（floor = 本值 × bright / RENDER_BRIGHT_MAX）：固定值会让
+# 深色封面从 lv=0 到 1.0 全程锁在同一个输出，又变回「固定平台」；
+# 现在静音侧 floor≈1（保留 1% 起步）、满档 18，全程随音量连续变化。
+# 实测：暗封面 (92,88,80) 过 gamma 是 (15,13,10)，×0.35 只有 (5,4,3) → 补到 18/255 才可见。
+RENDER_MIN_GLOW = 18
 
 # WASAPI 设备峰值表接口。IID 后四位是 D008E73E0064 —— 网上常见的
 # D01E1FE83D21C 是错的，Activate 会直接回 0x80004002 E_NOINTERFACE。
@@ -915,13 +917,14 @@ def render_brightness(level):
 
 
 def with_glow(rgb, ref, floor):
-    """极暗灯珠的色相保底：按 ref 的色相比例把 rgb 至少抬到 floor。
+    """暗灯珠的最低可见亮度保底：按 ref 的色相比例把 rgb 至少抬到 floor。
 
     rgb = 最终 PWM 值；ref = 该灯珠过完 gamma 的封面色（保留色相）。
     floor **必须由调用方按当前亮度给出**（1~RENDER_MIN_GLOW），不能传固定值：
-    固定保底会让深色封面在整个音量范围内输出同一个亮度，变成固定平台。
+    固定保底会让深色封面在整个音量范围内输出同一个亮度，变成固定平台；
+    floor 也别定得太小（旧版 3/255 对 gamma 后 5/255 的暗灯根本不触发）。
     只在「逻辑上已点亮」的灯珠上调用，熄灭的不动；纯黑封面色没有色相可依，
-    退化为中性微光。这样「亮了几颗」和「肉眼看见几颗」才对得上。
+    退化为中性灰。这样「亮了几颗」和「肉眼看见几颗」才对得上。
     """
     if max(rgb) >= floor:
         return rgb
@@ -1612,8 +1615,8 @@ class Monitor:
             gamma_base = [apply_gamma(c) for c in base]
             n = 1.0 + lv * (LED_COUNT - 1)   # 颗数不做门限；亮度另由 render_brightness 从 1% 起步
             bright = render_brightness(lv)
-            # 保底强度随亮度缩放：静音侧约 1/255、满档 3/255，全程连续，
-            # 不会让深色封面从 lv=0 到 1.0 都锁定在同一个亮度。
+            # 保底强度随亮度缩放：静音侧约 1/255、满档 18/255，全程连续，
+            # 既不会让深色封面锁在同一个亮度，也不会「补了还是看不见」。
             glow_level = RENDER_MIN_GLOW * bright / RENDER_BRIGHT_MAX
             out = [(0, 0, 0)] * LED_COUNT
             whole, frac = int(n), n - int(n)
@@ -1624,7 +1627,7 @@ class Monitor:
                 # 只剩 1 颗时不能把它自己削暗，否则小音量会忽明忽暗。
                 fade = frac if (whole >= 2 and i == whole - 1 and frac > 0.06) else 1.0
                 raw = scale(gamma_base[idx], bright * fade)
-                # 极暗封面色会被 int 截断成全黑，按它自己的色相补一丝微光
+                # 中暗/极暗封面色乘完亮度只剩几个 /255，按自身色相补到最低可见亮度
                 floor = max(1, round(glow_level * fade))
                 out[idx] = with_glow(raw, gamma_base[idx], floor)
             return out
