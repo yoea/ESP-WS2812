@@ -601,6 +601,11 @@ RENDER_SILENCE_GATE = 0.005
 # 现在静音侧 floor≈1（保留 1% 起步）、满档 18，全程随音量连续变化。
 # 实测：暗封面 (92,88,80) 过 gamma 是 (15,13,10)，×0.35 只有 (5,4,3) → 补到 18/255 才可见。
 RENDER_MIN_GLOW = 18
+# 保底放大时按「感知域」比例，并轻度去饱和（0 = 原色相，1 = 全灰）。
+# gamma 是 2.8 次方，拿 PWM 域的通道比例当色相会把近中性的暗蓝灰 (56,59,75)
+# 放大成纯蓝 (4,4,8)；按感知比例 + 25% 去饱和才是 (6,7,8) 这种偏米白的浅蓝。
+# 真蓝 (20,30,60) 补完仍是 (4,5,8)，色相不会被抹掉。
+GLOW_DESAT = 0.25
 
 # WASAPI 设备峰值表接口。IID 后四位是 D008E73E0064 —— 网上常见的
 # D01E1FE83D21C 是错的，Activate 会直接回 0x80004002 E_NOINTERFACE。
@@ -919,7 +924,10 @@ def render_brightness(level):
 def with_glow(rgb, ref, floor):
     """暗灯珠的最低可见亮度保底：按 ref 的色相比例把 rgb 至少抬到 floor。
 
-    rgb = 最终 PWM 值；ref = 该灯珠过完 gamma 的封面色（保留色相）。
+    rgb = 最终 PWM 值；**ref 必须是感知域的封面色（未过 gamma）**。
+    这里不能传 gamma_base：gamma 是 2.8 次方，会把通道差异放大，
+    近中性略蓝的 (56,59,75) 过 gamma 成了 (4,4,8)，照这个比例补出来就是纯蓝。
+    按感知比例放大、再做 GLOW_DESAT 轻度去饱和，才是「偏米白的浅蓝」。
     floor **必须由调用方按当前亮度给出**（1~RENDER_MIN_GLOW），不能传固定值：
     固定保底会让深色封面在整个音量范围内输出同一个亮度，变成固定平台；
     floor 也别定得太小（旧版 3/255 对 gamma 后 5/255 的暗灯根本不触发）。
@@ -928,11 +936,12 @@ def with_glow(rgb, ref, floor):
     """
     if max(rgb) >= floor:
         return rgb
-    m = max(ref)
-    if m <= 0:
+    gray = max(ref)
+    if gray <= 0:
         return (floor, floor, floor)
-    k = floor / m
-    return tuple(min(255, max(0, round(v * k))) for v in ref)
+    k = floor / gray
+    return tuple(min(255, max(0, round((v + (gray - v) * GLOW_DESAT) * k)))
+                 for v in ref)
 
 
 def mic_leds(in_use, level=0.0, reverse=False):
@@ -1627,9 +1636,11 @@ class Monitor:
                 # 只剩 1 颗时不能把它自己削暗，否则小音量会忽明忽暗。
                 fade = frac if (whole >= 2 and i == whole - 1 and frac > 0.06) else 1.0
                 raw = scale(gamma_base[idx], bright * fade)
-                # 中暗/极暗封面色乘完亮度只剩几个 /255，按自身色相补到最低可见亮度
+                # 中暗/极暗封面色乘完亮度只剩几个 /255，补到最低可见亮度。
+                # 保底按**感知域** base[idx] 的色相比例来（不是 gamma_base）：
+                # 用 PWM 域比例会把近中性的暗蓝灰补成纯蓝，见 with_glow 的说明。
                 floor = max(1, round(glow_level * fade))
-                out[idx] = with_glow(raw, gamma_base[idx], floor)
+                out[idx] = with_glow(raw, base[idx], floor)
             return out
 
         return [(0, 0, 0)] * LED_COUNT
