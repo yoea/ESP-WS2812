@@ -27,7 +27,8 @@ VU 峰值 80%。固件侧 --brightness 默认满档，一般别动。
 
 板载 LED（GPIO2 / D4）现在兼两职：
     常驻状态 —— 麦克风没占用 = 熄灭（待机静默）；麦克风占用 = 常亮
-    事件脉冲 —— 切歌闪 2 下 / 灯效状态切换闪 3 下（脉冲优先，闪完回到常驻状态）
+    事件脉冲 —— 切歌闪 2 下 / 封面就绪闪 1 下 / 状态切换闪 3 下
+                （脉冲优先，闪完回到常驻状态；封面只在明显滞后于切歌时才单独报）
 主机失联（关机 / 拔 USB / 后台服务崩）由固件自己判断：3 秒没数据又没收到 OFF
 就转成温柔呼吸（PWM 渐亮渐暗，2.6s 一个来回）—— 那时候串口已经断了，
 这台电脑发不出任何命令，只能由固件自己接管。加 --no-status-led 可整块关掉。
@@ -288,6 +289,7 @@ class MediaWatcher:
         self._thumb_hash = None
         self.color = None                     # 主色（palette[0]）
         self.palette = []                     # [(rgb, weight), ...] 九宫格配色
+        self.cover_updates = 0                # 每次成功解码新封面 +1，给板载 LED 报「就绪」
         self._err_logged = False
 
         # 事件驱动：切歌时 SMTC 会回调，立刻置 dirty 让轮询循环马上采样
@@ -434,6 +436,7 @@ class MediaWatcher:
             return                                    # 还是旧封面，下轮再试
         self._thumb_hash = digest
         self._set_palette(data)
+        self.cover_updates += 1               # 「封面真正换好」的瞬间，板载 LED 会报一声
         self._pending = False
 
     def _set_palette(self, data):
@@ -575,6 +578,10 @@ RENDER_FULL_PEAK = 1.00      # 满档对应的输出峰值（--render-full-peak 
 # 这里全程随 lv 连续变化。数字输出没有底噪，也不套麦克风声音门限，颗数至少 1 颗。
 RENDER_BRIGHT_MAX = 0.37
 RENDER_BRIGHT_FLOOR = 0.01
+# 极暗封面色过 gamma 后可能只剩 (0,1,4)，再乘低亮度系数会被 int 截断成 (0,0,0)
+# —— 逻辑上点亮了、肉眼却看不见，表现为「第二颗亮、第一颗灭」。
+# 给这种灯珠按自身色相比例抬到一个最低可见 PWM；3/255 很暗，不是亮度平台。
+RENDER_MIN_GLOW = 3
 
 # WASAPI 设备峰值表接口。IID 后四位是 D008E73E0064 —— 网上常见的
 # D01E1FE83D21C 是错的，Activate 会直接回 0x80004002 E_NOINTERFACE。
@@ -890,6 +897,22 @@ def render_brightness(level):
     return RENDER_BRIGHT_FLOOR + (RENDER_BRIGHT_MAX - RENDER_BRIGHT_FLOOR) * lv
 
 
+def with_glow(rgb, ref, floor):
+    """极暗灯珠的色相保底：按 ref 的色相比例把 rgb 至少抬到 floor。
+
+    rgb = 最终 PWM 值；ref = 该灯珠过完 gamma 的封面色（保留色相）。
+    只在「逻辑上已点亮」的灯珠上调用，熄灭的不动；纯黑封面色没有色相可依，
+    退化为中性微光。这样「亮了几颗」和「肉眼看见几颗」才对得上。
+    """
+    if max(rgb) >= floor:
+        return rgb
+    m = max(ref)
+    if m <= 0:
+        return (floor, floor, floor)
+    k = floor / m
+    return tuple(min(255, max(0, round(v * k))) for v in ref)
+
+
 def mic_leds(in_use, level=0.0, reverse=False):
     """麦克风态的 8 颗颜色（**已经是最终 PWM 值**，调用方要按 raw 直出）。
 
@@ -1155,10 +1178,12 @@ CMD_STATUS_PULSE = 0x08
 # 现在只用 OFF（待机静默）/ ON（麦克风在用）；固件 BLINK(2) 不用。
 # 事件脉冲走 0x08，失联呼吸由固件自己接管。
 STATUS_LED_OFF, STATUS_LED_ON, STATUS_LED_BLINK = 0, 1, 2
-# 事件提示：闪几下。"切歌"和"状态切换"给不同的下数，不用看屏幕就知道刚发生了什么。
-# 为什么不复述「正在放歌 / 麦克风电平高低」：那两件事 8 颗灯珠已经说得够清楚了。
-PULSE_TRACK = 2            # 切歌
+# 事件提示：闪几下。三个事件给不同下数，不用看屏幕就知道刚发生了什么。
+# 切歌 = SMTC 标题变了（不代表封面已到）；封面就绪 = 封面字节哈希真的变化、
+# 取色更新完成 —— 网易云这类播放器可能滞后好几秒，单独报一声才知道什么时候拿到。
+PULSE_TRACK = 2            # 切歌（标题变化）
 PULSE_STATE = 3            # 状态切换（media / mic / idle 之间）
+PULSE_COVER = 1            # 封面/SMTC 信息真正取到
 # 两次脉冲之间的最小间隔：连按「下一首」时别闪成一片频闪灯
 PULSE_GUARD = 0.8
 # 事件发生后，面板上把这行字保留多久
@@ -1341,7 +1366,8 @@ class LedStrip:
         self._write(build_frame(CMD_STATUS_LED, bytes([mode])))
 
     def pulse(self, times: int):
-        """板载 LED 短闪 times 下后自动熄灭 —— 事件提示（切歌 2 / 状态切换 3）。
+        """板载 LED 短闪 times 下后自动熄灭 —— 事件提示
+        （封面就绪 1 / 切歌 2 / 状态切换 3）。
 
         和常驻灯态不同，这里绝不能缓存：同一个事件反复发生就得反复闪。
         闪的节奏由固件按毫秒自己走，不受主循环 100Hz 帧率的限制。"""
@@ -1430,6 +1456,8 @@ class Monitor:
         self.status_led = status_led      # 板载 LED 状态指示 + 事件提示（--no-status-led 可关）
         self._prev_state = None           # 上一次的灯效状态：用来发现「状态切换」
         self._prev_track = None           # 上一首曲子：用来发现「切歌」
+        self._prev_cover_updates = 0      # 上次看到的封面更新计数
+        self._last_track_change_at = 0.0  # 上次检测到切歌的时刻：判断封面是否滞后
         self._pulse_guard_until = 0.0     # 脉冲冷却到期时刻，防止连按「下一首」闪成一片
         self._note = "灭 · 静默"          # 面板「板载」那一行：事件文案
         self._note_until = 0.0
@@ -1527,7 +1555,10 @@ class Monitor:
                 # 只有「已经亮了 2 颗以上、正在长出下一颗」才做小数渐入；
                 # 只剩 1 颗时不能把它自己削暗，否则小音量会忽明忽暗。
                 fade = frac if (whole >= 2 and i == whole - 1 and frac > 0.06) else 1.0
-                out[idx] = scale(gamma_base[idx], bright * fade)
+                raw = scale(gamma_base[idx], bright * fade)
+                # 极暗封面色会被 int 截断成全黑，按它自己的色相补一丝微光
+                out[idx] = with_glow(raw, gamma_base[idx],
+                                     max(1, round(RENDER_MIN_GLOW * fade)))
             return out
 
         return [(0, 0, 0)] * LED_COUNT
@@ -1572,13 +1603,17 @@ class Monitor:
         常驻状态每帧算一次，靠 set_status_led 的缓存去重（值不变一个字节都不发）：
           麦克风在用   -> 常亮（STATUS_LED_ON）
           麦克风没在用 -> 静默熄灭（STATUS_LED_OFF），不做任何闪烁
-        事件脉冲（切歌 2 下 / 状态切换 3 下）照旧发 0x08：固件里 pulse 优先于
-        常驻灯态，闪完自动回到常亮或熄灭。电平档位变化不发脉冲，否则会频闪。
-
+        事件脉冲走 0x08，固件里 pulse 优先于常驻灯态，闪完自动回到常亮或熄灭：
+          闪 2 下 = 切歌（SMTC 标题变了，不代表封面已到）
+          闪 3 下 = 灯效状态切换
+          闪 1 下 = 封面真正就绪（MD5 变化、取色更新完成），且明显滞后于切歌
+        电平档位变化不发脉冲，否则会频闪。
         （主机失联的温柔呼吸仍由固件在 3 秒无数据后自己接管。）
         """
         now = time.time()
         track = self._track_key()
+        cover = (self.media.cover_updates
+                 if (self.media and self.media.available) else 0)
 
         # 1) 常驻状态：只表达「麦克风有没有被占用」，与放不放歌无关
         if self.mic is not None and self.mic.in_use:
@@ -1588,16 +1623,23 @@ class Monitor:
             strip.set_status_led(STATUS_LED_OFF)
             self._status_note = "灭 · 待机静默"
 
-        # 2) 事件脉冲
+        # 2) 事件脉冲（每帧最多一条：固件收到第二条 0x08 会覆盖第一条）
         times, note = 0, ""
         if self._prev_state is not None:          # None = 程序刚起来，先只记基线不闪
             if self.state != self._prev_state:
                 times, note = PULSE_STATE, f"闪 {PULSE_STATE} · 状态切换"
             elif track and self._prev_track and track != self._prev_track:
                 times, note = PULSE_TRACK, f"闪 {PULSE_TRACK} · 切歌"
+                self._last_track_change_at = now
+            elif (cover != self._prev_cover_updates
+                  and now - self._last_track_change_at >= PULSE_GUARD):
+                # 封面明显滞后于标题（网易云常见）：这时才需要单独报「取到了」。
+                # 快速切歌时上面的 2 下已覆盖，不补闪，避免两条 0x08 互相覆盖。
+                times, note = PULSE_COVER, f"闪 {PULSE_COVER} · 封面就绪"
 
         self._prev_state = self.state
         self._prev_track = track
+        self._prev_cover_updates = cover
 
         if times and now >= self._pulse_guard_until:
             strip.pulse(times)
@@ -2032,9 +2074,11 @@ def connect(port, baud, wait=0.0, max_level=MAX_LEVEL):
 
 
 def run_demo(strip: LedStrip):
-    print(f"[demo] 板载 LED（GPIO2/D4）：切歌信号闪 {PULSE_TRACK} 下 → "
-          f"状态切换信号闪 {PULSE_STATE} 下")
+    print(f"[demo] 板载 LED（GPIO2/D4）：切歌闪 {PULSE_TRACK} 下 → "
+          f"封面就绪闪 {PULSE_COVER} 下 → 状态切换闪 {PULSE_STATE} 下")
     strip.pulse(PULSE_TRACK)
+    time.sleep(1.0)
+    strip.pulse(PULSE_COVER)
     time.sleep(1.0)
     strip.pulse(PULSE_STATE)
     time.sleep(1.4)
@@ -2249,7 +2293,8 @@ def run_monitor(strip: LedStrip, app_filter=None, cover_layout="spatial",
           f"固件侧 --brightness {strip.brightness}")
     if status_led:
         print("          板载 LED(GPIO2/D4)：未占用=灭 / 占用=常亮；"
-              f"另切歌闪 {PULSE_TRACK} 下 / 状态切换闪 {PULSE_STATE} 下 / 失联温柔呼吸")
+              f"另切歌闪 {PULSE_TRACK} 下 / 封面就绪闪 {PULSE_COVER} 下 / "
+              f"状态切换闪 {PULSE_STATE} 下 / 失联温柔呼吸")
     print("          Ctrl+C 退出\n")
 
     dsp = Display(enabled=ui)
