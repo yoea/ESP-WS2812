@@ -6,7 +6,8 @@
 两件事，按优先级：
   1. 有音乐在播 —— 认出系统里正在播放的音乐，把专辑封面的配色铺到 8 颗灯珠上；
      **亮几颗 / 多亮由默认输出设备的实时峰值决定**（读的是系统播放混音，
-     不是麦克风），颜色仍是这 8 颗封面配色。输出端点读不到峰值时才降级回整条呼吸。
+     不是麦克风），颜色仍是这 8 颗封面配色。真静音（peak 约 0）一颗都不亮，
+     极小声从 1% 亮度起步。输出端点读不到峰值时才降级回整条呼吸。
   2. 没在播音乐 —— 麦克风没被占用：**灯带全灭、板载 LED 也灭**，完全静默；
      正在被占用：板载 LED 常亮，音量同时决定亮几颗（1~8，从最近端往最远端）、
      颜色（绿 -> 黄 -> 橙 -> 红）和亮度（1% -> 80% 最终 PWM 占空比）；
@@ -578,9 +579,14 @@ RENDER_FULL_PEAK = 1.00      # 满档对应的输出峰值（--render-full-peak 
 # 这里全程随 lv 连续变化。数字输出没有底噪，也不套麦克风声音门限，颗数至少 1 颗。
 RENDER_BRIGHT_MAX = 0.37
 RENDER_BRIGHT_FLOOR = 0.01
+# 真静音（数字输出精确为 0，没有底噪）时一颗都不亮；刚过门限的极小声仍从 1% 起步。
+# 只用来区分「完全没声音」和「有一点声音」，别调大，否则会吞掉小音量段。
+RENDER_SILENCE_GATE = 0.005
 # 极暗封面色过 gamma 后可能只剩 (0,1,4)，再乘低亮度系数会被 int 截断成 (0,0,0)
 # —— 逻辑上点亮了、肉眼却看不见，表现为「第二颗亮、第一颗灭」。
-# 给这种灯珠按自身色相比例抬到一个最低可见 PWM；3/255 很暗，不是亮度平台。
+# 保底强度必须**跟着亮度走**：固定 3/255 会让深色封面从 lv=0 到 1.0 全程锁在
+# 同一个输出（(0,1,4) 的最大通道只有 4，乘 0.37 也到不了 3），又变回固定平台。
+# 所以这里只是「满档时的上限」，实际 floor 由调用方按 bright 缩放。
 RENDER_MIN_GLOW = 3
 
 # WASAPI 设备峰值表接口。IID 后四位是 D008E73E0064 —— 网上常见的
@@ -901,6 +907,8 @@ def with_glow(rgb, ref, floor):
     """极暗灯珠的色相保底：按 ref 的色相比例把 rgb 至少抬到 floor。
 
     rgb = 最终 PWM 值；ref = 该灯珠过完 gamma 的封面色（保留色相）。
+    floor **必须由调用方按当前亮度给出**（1~RENDER_MIN_GLOW），不能传固定值：
+    固定保底会让深色封面在整个音量范围内输出同一个亮度，变成固定平台。
     只在「逻辑上已点亮」的灯珠上调用，熄灭的不动；纯黑封面色没有色相可依，
     退化为中性微光。这样「亮了几颗」和「肉眼看见几颗」才对得上。
     """
@@ -1543,10 +1551,17 @@ class Monitor:
             # 直接拿感知 RGB 乘系数再 raw 直出会过曝泛白（亮暗通道一起被抬起来）。
             # 过完 gamma，最亮的白色封面约 94/255，与旧封面呼吸的最亮帧一致。
             lv = self.render_level.value
+            self._raw_frame = True          # current 是 PWM 域，静音那帧也不能再过一次 gamma
+            # 真静音：数字输出精确为 0（没有底噪），一颗都不亮。
+            # 刚过门限的极小声仍走下面的 1% 起步，两者不冲突；靠 0.035s 平滑柔和淡出。
+            if self.render_level.peak < RENDER_SILENCE_GATE:
+                return [(0, 0, 0)] * LED_COUNT
             gamma_base = [apply_gamma(c) for c in base]
             n = 1.0 + lv * (LED_COUNT - 1)   # 颗数不做门限；亮度另由 render_brightness 从 1% 起步
             bright = render_brightness(lv)
-            self._raw_frame = True          # gamma_base 已是 PWM 值，不能再过一次 gamma
+            # 保底强度随亮度缩放：静音侧约 1/255、满档 3/255，全程连续，
+            # 不会让深色封面从 lv=0 到 1.0 都锁定在同一个亮度。
+            glow_level = RENDER_MIN_GLOW * bright / RENDER_BRIGHT_MAX
             out = [(0, 0, 0)] * LED_COUNT
             whole, frac = int(n), n - int(n)
             for i, idx in enumerate(mic_order(self.mic_reverse)):
@@ -1557,8 +1572,8 @@ class Monitor:
                 fade = frac if (whole >= 2 and i == whole - 1 and frac > 0.06) else 1.0
                 raw = scale(gamma_base[idx], bright * fade)
                 # 极暗封面色会被 int 截断成全黑，按它自己的色相补一丝微光
-                out[idx] = with_glow(raw, gamma_base[idx],
-                                     max(1, round(RENDER_MIN_GLOW * fade)))
+                floor = max(1, round(glow_level * fade))
+                out[idx] = with_glow(raw, gamma_base[idx], floor)
             return out
 
         return [(0, 0, 0)] * LED_COUNT
@@ -2269,6 +2284,8 @@ def run_monitor(strip: LedStrip, app_filter=None, cover_layout="spatial",
         if mon.render_meter.available:
             print(f"          播放中 -> 封面配色 + 系统输出峰值驱动（{cover_layout}，"
                   f"满档 {render_full_peak:g}，颗数/亮度随音量）")
+            print(f"          真静音 peak<{RENDER_SILENCE_GATE:g} 全灭；"
+                  f"极小声从 {RENDER_BRIGHT_FLOOR:.0%} 起步")
         else:
             print(f"          播放中 -> 封面配色 + 呼吸（{cover_layout}，"
                   f"周期 {breathe_period:g}s，幅度 {breathe_depth:.2f}）"
