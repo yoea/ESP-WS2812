@@ -4,8 +4,9 @@
 音乐封面呼吸灯（WeMOS D1 mini + 8 颗 WS2812B）—— 唯一脚本
 
 两件事，按优先级：
-  1. 有音乐在播 —— 认出系统里正在播放的音乐，把专辑封面的配色铺到 8 颗灯珠上，
-     整条灯带跟着一个缓慢的呼吸节奏明暗起伏。
+  1. 有音乐在播 —— 认出系统里正在播放的音乐，把专辑封面的配色铺到 8 颗灯珠上；
+     **亮几颗 / 多亮由默认输出设备的实时峰值决定**（读的是系统播放混音，
+     不是麦克风），颜色仍是这 8 颗封面配色。输出端点读不到峰值时才降级回整条呼吸。
   2. 没在播音乐 —— 麦克风没被占用：**灯带全灭、板载 LED 也灭**，完全静默；
      正在被占用：板载 LED 常亮，音量同时决定亮几颗（1~8，从最近端往最远端）、
      颜色（绿 -> 黄 -> 橙 -> 红）和亮度（1% -> 80% 最终 PWM 占空比）；
@@ -13,13 +14,15 @@
 
 「谁在用」读 Windows 隐私同意记录（ConsentStore 下 microphone 键的
 LastUsedTimeStart / LastUsedTimeStop），带去抖滤掉输入法那种几十毫秒的短脉冲；
-「声音多大」读 WASAPI 的 IAudioMeterInformation 设备峰值（只读，不打开捕获流，
-所以不会把自己写进注册表把判定污染成永远在用）。两者都是标准库，零第三方依赖。
-实测见下方「麦克风占用检测」分区，渲染 50Hz。
+「声音多大」分两路，都是 WASAPI 的 IAudioMeterInformation 设备峰值，
+**只读 meter、不打开任何捕获流**，所以不会把自己写进注册表把判定污染成永远在用：
+  - 放歌时读默认输出端点 (eRender/eConsole)：系统播放混音峰值，戴耳机也照样有值；
+  - 麦克风 VU 读默认输入端点 (eCapture/eMultimedia)：需要别的应用占着麦克风。
+同一份 ctypes COM 代码，只是 GetDefaultAudioEndpoint 的参数不同。零第三方依赖，渲染 50Hz。
 
-封面呼吸受 MAX_LEVEL = 0.70（--max-level）限制，在 gamma 之前乘到每颗灯上。
-电平表是例外：亮度按「最终 PWM 占空比」直出（1%/10% 过 gamma 会全黑），
-自己的曲线最高 80%。固件侧 --brightness 默认满档，一般别动。
+降级路径的封面呼吸受 MAX_LEVEL = 0.70（--max-level）限制，在 gamma 之前乘到每颗灯上。
+两种声音驱动灯效是例外：亮度按「最终 PWM 占空比」直出（1% 过 gamma 会全黑），
+放歌峰值 60%、麦克风 VU 峰值 80%。固件侧 --brightness 默认满档，一般别动。
 
 板载 LED（GPIO2 / D4）现在兼两职：
     常驻状态 —— 麦克风没占用 = 熄灭（待机静默）；麦克风占用 = 常亮
@@ -54,8 +57,10 @@ LastUsedTimeStart / LastUsedTimeStop），带去抖滤掉输入法那种几十�
     --breathe-depth 0.40     呼吸幅度 0~1，越大明暗差别越明显
     --no-mic                 关掉麦克风指示，没播音乐就熄灯
     --mic-reverse            翻转电平条点亮方向（默认从离板子最近的灯开始）
-    --mic-full-peak 1.00     电平表满档对应的设备峰值（默认吃满 0~1 量程）
-    --mic-calibrate          采样 5 秒设备峰值，帮你校准 --mic-full-peak
+    --mic-full-peak 1.00     麦克风 VU 满档对应的输入峰值（默认吃满 0~1 量程）
+    --mic-calibrate          采样 5 秒输入峰值，帮你校准 --mic-full-peak
+    --render-full-peak 1.00  放歌时输出峰值满档值（灯太暗调小，太容易满档调大）
+    --render-calibrate       播放一首歌采样 5 秒，给 --render-full-peak 建议
     --no-status-led          不用板载 LED(GPIO2/D4)做状态指示和事件提示
     --no-ui                  不画终端面板（后台运行时自动生效）
     --background             后台模式：静默运行 + 日志写 logs/led_host.log（自启时用）
@@ -554,7 +559,16 @@ MIC_NOISE_FLOOR = 0.006      # 实测安静底噪 0.0066~0.0105，低于此不�
 # 旧默认 0.35 只用了 1/3 量程，再叠加「lv>=0.70 就 8 颗」，实际 peak≈0.25 就到顶。
 MIC_FULL_PEAK = 1.00         # 满档对应的设备峰值（默认，可用 --mic-full-peak 改）
 MIC_LEVEL_TAU = 0.035        # 电平快平滑（50Hz 下约 2 帧），波形跟手但不抖
-MIC_SMOOTH_TAU = 0.035       # mic 态专用的颜色平滑；全局 0.15s 会把波形削平
+MIC_SMOOTH_TAU = 0.035       # 声音驱动灯效的颜色平滑；全局 0.15s 会把波形削平
+
+# ---- 放歌时：系统输出峰值驱动封面配色灯 ----
+# 读默认输出设备的 IAudioMeterInformation（同一套 COM 代码，只是端点从
+# eCapture 换成 eRender），不开捕获流、不碰 ConsentStore、戴耳机也照样有值。
+RENDER_NOISE_FLOOR = 0.0     # 数字输出没有底噪，静音就是 0
+RENDER_FULL_PEAK = 1.00      # 满档对应的输出峰值（--render-full-peak 可调）
+# 封面配色可能是白色/浅色，8 颗全亮时电流比 VU 的饱和单色高，
+# 所以在 VU 亮度曲线上再乘一道安全系数：峰值 80% × 0.75 = 60% PWM。
+RENDER_BRIGHT_CAP = 0.75
 
 # WASAPI 设备峰值表接口。IID 后四位是 D008E73E0064 —— 网上常见的
 # D01E1FE83D21C 是错的，Activate 会直接回 0x80004002 E_NOINTERFACE。
@@ -592,17 +606,21 @@ def mic_sessions_in_use(records, now_ft):
 
 
 class MicLevelMeter:
-    """WASAPI IAudioMeterInformation：只读麦克风的设备级峰值，不打开捕获流。
+    """WASAPI IAudioMeterInformation：只读设备级峰值，不打开任何捕获流。
 
-    这一点是关键 —— 如果为了拿音量自己起一路录音（ffmpeg / pyaudio 都行），
-    那个进程会把自己写进 ConsentStore，于是「麦克风没在使用」永远不成立。
-    峰值表不产生流，注册表判定保持干净。纯 ctypes，零第三方依赖。
+    data_flow / role 决定读哪个默认端点：
+      (1, 1) = eCapture / eMultimedia -> 麦克风输入峰值（原有 VU 用这个）
+      (0, 0) = eRender  / eConsole    -> 系统播放混音峰值（放歌时驱动灯效用这个）
+    输出端点这条路连捕获流都不用开，纯读 meter，更不会污染 ConsentStore。
 
-    实测：无人捕获时 peak 恒 0；有人捕获时安静 0.007~0.010、出声 0.104，
-    6 秒音量渐大时 0.009 -> 0.083 单调递增；单次调用 21.5 微秒。
+    不开捕获流是关键 —— 自己起录音会把进程写进 ConsentStore，
+    于是「麦克风没在使用」永远不成立。峰值表不产生流，判定保持干净。
+    纯 ctypes，零第三方依赖；单次调用约 21.5 微秒。
     """
 
-    def __init__(self):
+    def __init__(self, data_flow=1, role=1):
+        self.data_flow = data_flow
+        self.role = role
         self.available = False
         self.peak = 0.0
         self.error = ""
@@ -656,10 +674,12 @@ class MicLevelMeter:
                 raise OSError("CoCreateInstance 0x%08X" % hr)
 
             # IMMDeviceEnumerator::GetDefaultAudioEndpoint = vtable[4]
+            # (1,1)=默认麦克风输入；(0,0)=默认输出设备（系统播放混音峰值）
             p_dev = c_void_p()
             hr = vtcall(p_enum, 4,
                         [c_void_p, c_int, c_int, POINTER(c_void_p)])(
-                            p_enum.value, 1, 1, byref(p_dev)) & 0xffffffff
+                            p_enum.value, self.data_flow, self.role,
+                            byref(p_dev)) & 0xffffffff
             if hr or not p_dev.value:
                 raise OSError("GetDefaultAudioEndpoint 0x%08X" % hr)
 
@@ -703,10 +723,11 @@ class MicLevel:
     正常说话就会立刻变成 target=1.0（8 颗全亮），这正是之前那个 bug。
     """
 
-    def __init__(self, full_peak=MIC_FULL_PEAK):
+    def __init__(self, full_peak=MIC_FULL_PEAK, noise_floor=MIC_NOISE_FLOOR):
         self.value = 0.0        # 平滑后的电平，灯效读这个
         self.peak = 0.0         # 本次原始峰值，面板显示
-        self.full = max(MIC_NOISE_FLOOR * 2, float(full_peak))   # 满档峰值
+        self.noise_floor = float(noise_floor)
+        self.full = max(self.noise_floor + 1e-3, float(full_peak))   # 满档峰值
         self._last = None
 
     def update(self, peak, now=None, dt=None):
@@ -716,8 +737,8 @@ class MicLevel:
         dt = max(0.0, min(0.5, dt))
         self._last = now
         self.peak = peak
-        span = max(1e-6, self.full - MIC_NOISE_FLOOR)
-        target = min(1.0, max(0.0, peak - MIC_NOISE_FLOOR) / span)
+        span = max(1e-6, self.full - self.noise_floor)
+        target = min(1.0, max(0.0, peak - self.noise_floor) / span)
         k = 1.0 - math.exp(-dt / MIC_LEVEL_TAU)
         self.value += (target - self.value) * k
         # 吸附：一阶低通永远差一点点，不处理的话最大声会停在「7 颗 + 第 8 颗 99.9% 亮」
@@ -1065,6 +1086,12 @@ class Display:
         if st == "media" and m and m.available and m.palette:
             blocks = "".join(bg(c, "  " * max(1, round(w * 9))) for c, w in m.palette)
             L.append(self._row(f"配色 {blocks}  {len(m.palette)} 色"))
+        rm = getattr(mon, "render_meter", None)
+        if st == "media" and rm and rm.available:
+            lv = mon.render_level.value
+            L.append(self._row(f"输出 {mic_led_count(lv):.1f}/{LED_COUNT} 颗  "
+                               f"亮度 {mic_brightness(lv) * RENDER_BRIGHT_CAP:.0%}  "
+                               f"峰值 {mon.render_level.peak:.3f}"))
         if frame:
             L.append(self._row("灯珠 " + "".join(bg(c, "  ") for c in frame)))
         if getattr(mon, "status_led", False):
@@ -1128,9 +1155,11 @@ FRAME_INTERVAL = 1.0 / FRAME_HZ
 # 固件侧不再二次打折：两道相乘会把 70% 压成 37%（128/255 × 0.70），灯明显偏暗。
 # 真要限制电流就调 --max-level，它是唯一旋钮。
 DEFAULT_BRIGHTNESS = 255
-# host 侧输出上限（0~1），在 gamma 之前乘到每颗灯上 —— 封面呼吸受它限制。
-# 电平表是例外：亮度按最终 PWM 占空比直出（见 MIC_BRIGHT_STOPS / set_all(raw=True)），
-# 峰值 80%，且用的是饱和单色而非全白，8 颗电流仍低于「8 颗全白满亮」的情形。
+# host 侧输出上限（0~1），在 gamma 之前乘到每颗灯上 —— 降级封面呼吸受它限制。
+# 两种声音驱动灯效是例外：亮度按最终 PWM 占空比直出
+# （见 MIC_BRIGHT_STOPS / RENDER_BRIGHT_CAP / set_all(raw=True)），
+# 放歌峰值 60%、VU 峰值 80%；放歌用的是封面色（可能偏白），所以额外压了一道
+# RENDER_BRIGHT_CAP，避免 8 颗全白把 USB 500mA 打穿。
 # 70% 感知亮度对应 PWM gamma(178)=93，8 颗约 173mA，加板子约 250mA，离 USB 500mA 还有余量。
 MAX_LEVEL = 0.70
 
@@ -1263,9 +1292,10 @@ class LedStrip:
     def set_all(self, rgb_list, raw=False):
         """raw=True：rgb_list 已是最终 PWM 值（0~255），直接发，绕过 gamma 与 max_level。
 
-        电平表必须用这个模式：它给的 1%~80% 是「最终占空比」，
-        过一遍 gamma 会把 1% 压成 0/255、10% 压成约 0.4/255，肉眼全黑。
-        封面呼吸用默认 False，走 gamma + 70% 上限；待机全灭走哪条都一样。
+        声音驱动灯效（放歌封面灯 / 麦克风 VU）必须用这个模式：它们给的
+        1%~60% / 1%~80% 是「最终占空比」，过一遍 gamma 会把 1% 压成 0/255、
+        10% 压成约 0.4/255，肉眼全黑。降级封面呼吸用默认 False，
+        走 gamma + 70% 上限；待机全灭走哪条都一样。
         """
         payload = bytearray()
         for rgb in rgb_list:
@@ -1362,7 +1392,7 @@ class LedStrip:
 class Monitor:
     """
     三个状态，优先级从高到低：
-      media  正在播放 -> 铺封面配色，整条灯带同步呼吸
+      media  正在播放 -> 铺封面配色，输出峰值决定亮几颗/多亮（端点不可用才降级成整条呼吸）
       mic    没在播放 -> 麦克风没占用=灯带全灭+板载也灭 / 正在录音=按音量亮 1~8 颗
       idle   没在播放且麦克风检测不可用 -> 熄灭（只有非 Windows 才会落到这）
 
@@ -1373,7 +1403,7 @@ class Monitor:
     def __init__(self, app_filter=None, cover_layout="spatial",
                  breathe_period=BREATHE_PERIOD, breathe_depth=BREATHE_DEPTH,
                  mic=True, mic_reverse=False, status_led=True,
-                 mic_full_peak=MIC_FULL_PEAK):
+                 mic_full_peak=MIC_FULL_PEAK, render_full_peak=RENDER_FULL_PEAK):
         self.cover_layout = cover_layout
         self.breathe_period = max(0.2, breathe_period)
         self.breathe_depth = max(0.0, min(1.0, breathe_depth))
@@ -1389,6 +1419,9 @@ class Monitor:
         self.mic = MicWatcher() if mic else None
         self.meter = MicLevelMeter() if mic else None
         self.level = MicLevel(mic_full_peak) if mic else None
+        # 放歌时读系统输出峰值：与麦克风完全独立，--no-mic 也照常可用
+        self.render_meter = MicLevelMeter(0, 0)
+        self.render_level = MicLevel(render_full_peak, RENDER_NOISE_FLOOR)
         self.mic_reverse = bool(mic_reverse)
         self._raw_frame = False      # 电平表按最终 PWM 直出；其它灯效走 gamma
         self.state = "media"
@@ -1420,6 +1453,8 @@ class Monitor:
             self.mic.poll(now)
         if self.meter:
             self.level.update(self.meter.read(), now)
+        if self.render_meter and self.render_meter.available:
+            self.render_level.update(self.render_meter.read(), now)
 
         if self._media_on():
             self._media_off_since = None
@@ -1448,11 +1483,27 @@ class Monitor:
 
         if self.state == "media" and self.media.color:
             base = self._cover_base()
-            # 整条同步呼吸：亮度在 (1-depth) ~ 1 之间平滑往返。
-            phase = (now % self.breathe_period) / self.breathe_period
-            wave = 0.5 - 0.5 * math.cos(2 * math.pi * phase)     # 0 -> 1 -> 0
-            level = (1.0 - self.breathe_depth) + self.breathe_depth * wave
-            return [scale(c, level) for c in base]
+            if not (self.render_meter and self.render_meter.available):
+                # 降级：这台机器的输出端点读不到峰值，回到原来的整条封面呼吸
+                phase = (now % self.breathe_period) / self.breathe_period
+                wave = 0.5 - 0.5 * math.cos(2 * math.pi * phase)
+                level = (1.0 - self.breathe_depth) + self.breathe_depth * wave
+                return [scale(c, level) for c in base]
+
+            # 声音驱动：颜色仍是这 8 颗封面配色，亮几颗 / 多亮交给系统输出峰值。
+            # 与 VU 共用映射，只是把「绿->红」换成每颗自己的封面色，并压一道安全系数。
+            lv = self.render_level.value
+            n = mic_led_count(lv)
+            bright = mic_brightness(lv) * RENDER_BRIGHT_CAP
+            self._raw_frame = True          # 1%~60% 是最终 PWM，不能再过 gamma
+            out = [(0, 0, 0)] * LED_COUNT
+            whole, frac = int(n), n - int(n)
+            for i, idx in enumerate(mic_order(self.mic_reverse)):
+                if i >= whole:
+                    break
+                k = bright * (frac if (i == whole - 1 and frac > 0.06) else 1.0)
+                out[idx] = scale(base[idx], k)
+            return out
 
         return [(0, 0, 0)] * LED_COUNT
 
@@ -1468,10 +1519,12 @@ class Monitor:
 
     def tick(self, strip: LedStrip):
         target = self.compute_target()
-        # 只有「麦克风在用的电平表」要跟得上声音：0.15s 低通会把波形削平。
-        # 待机已是全灭，用全局 0.15s 让「录音结束 -> 全灭」的收尾更柔和。
-        vu = self.state == "mic" and self.mic and self.mic.in_use
-        tau = MIC_SMOOTH_TAU if vu else SMOOTH_TAU
+        # 声音驱动的两种态（录音 VU / 放歌封面灯）都要跟得上波形：0.15s 会削平。
+        # 待机全灭、以及输出端点不可用时的降级呼吸仍用 0.15s，过渡更柔和。
+        sound_driven = ((self.state == "mic" and self.mic and self.mic.in_use)
+                        or (self.state == "media" and self.render_meter
+                            and self.render_meter.available))
+        tau = MIC_SMOOTH_TAU if sound_driven else SMOOTH_TAU
         k = 1.0 - math.exp(-FRAME_INTERVAL / tau)
         self.current = [lerp_rgb(c, t, k) for c, t in zip(self.current, target)]
         strip.set_all(self.current, raw=self._raw_frame)
@@ -1663,7 +1716,8 @@ def _runtime_args(args):
              "--cover-layout", args.cover_layout,
              "--breathe-period", f"{args.breathe_period:g}",
              "--breathe-depth", f"{args.breathe_depth:g}",
-             "--mic-full-peak", f"{args.mic_full_peak:g}"]
+             "--mic-full-peak", f"{args.mic_full_peak:g}",
+             "--render-full-peak", f"{args.render_full_peak:g}"]
     if args.app_filter:
         parts += ["--app-filter", str(args.app_filter)]
     if args.no_mic or args.no_cpu:
@@ -2081,6 +2135,37 @@ def calibrate_mic(seconds=5.0):
     print("想让它更靠后（更不容易满档）就把值调大，上限 1.00；反之调小。")
 
 
+def calibrate_render(seconds=5.0):
+    """采样系统输出设备的峰值，帮用户标定 --render-full-peak。
+
+    同样只读 meter，不开 loopback 捕获流、不碰麦克风使用记录。
+    """
+    m = MicLevelMeter(0, 0)
+    if not m.available:
+        print(f"输出端点峰值接口不可用：{m.error}")
+        print("这台机器的声卡/驱动可能不支持 render meter，程序会自动降级回封面呼吸。")
+        return
+    print(f"采样 {seconds:g} 秒 —— 请播放一首常听的歌（音量用平时的水平）。")
+    t0 = time.time()
+    samples = []
+    while time.time() - t0 < seconds:
+        samples.append(m.read())
+        time.sleep(FRAME_INTERVAL)
+    if not samples:
+        print("采样时间太短，没有取到样本。")
+        return
+    hi = max(samples)
+    avg = sum(samples) / len(samples)
+    print(f"采样 {len(samples)} 次：最大 {hi:.4f} / 平均 {avg:.4f}"
+          f"   （当前满档 {RENDER_FULL_PEAK:g}）")
+    if hi <= 0.001:
+        print("没捕到播放音频：确认系统音量没静音、确实有声音在播，然后重跑一次。")
+        return
+    suggest = min(1.0, max(0.05, avg / 0.45))
+    print(f"想让平均音量落在约 4~5 颗：--render-full-peak {suggest:.2f}")
+    print("值越小灯越活跃（更容易满档），越大越保守；默认 1.00 已吃满 0~1 物理范围。")
+
+
 def diagnose(watch=False, full_peak=MIC_FULL_PEAK):
     """体检数据源。watch=True 时持续刷新，用来观察切歌能否跟上"""
     while True:
@@ -2088,6 +2173,11 @@ def diagnose(watch=False, full_peak=MIC_FULL_PEAK):
         print("媒体源体检")
         diagnose_media()
         diagnose_mic(full_peak)
+        print("\n系统输出端点体检（放歌灯效的数据源）")
+        rm = MicLevelMeter(0, 0)
+        print(f"  峰值接口：{'可用' if rm.available else '不可用 ' + rm.error}"
+              f"   当前 peak = {rm.read():.4f}")
+        print("  不可用会自动降级回整条封面呼吸；可用时放歌由输出峰值驱动")
         if not watch:
             print("\n" + "=" * 62)
             return
@@ -2102,13 +2192,18 @@ def diagnose(watch=False, full_peak=MIC_FULL_PEAK):
 def run_monitor(strip: LedStrip, app_filter=None, cover_layout="spatial",
                 ui=True, breathe_period=BREATHE_PERIOD, breathe_depth=BREATHE_DEPTH,
                 mic=True, mic_reverse=False, status_led=True,
-                mic_full_peak=MIC_FULL_PEAK):
+                mic_full_peak=MIC_FULL_PEAK, render_full_peak=RENDER_FULL_PEAK):
     mon = Monitor(app_filter, cover_layout, breathe_period, breathe_depth,
-                  mic, mic_reverse, status_led, mic_full_peak)
+                  mic, mic_reverse, status_led, mic_full_peak, render_full_peak)
     if mon.media.available:
         print("[monitor] 音乐封面呼吸灯")
-        print(f"          播放中 -> 封面配色 + 呼吸（{cover_layout}，"
-              f"周期 {breathe_period:g}s，幅度 {breathe_depth:.2f}）")
+        if mon.render_meter.available:
+            print(f"          播放中 -> 封面配色 + 系统输出峰值驱动（{cover_layout}，"
+                  f"满档 {render_full_peak:g}，颗数/亮度随音量）")
+        else:
+            print(f"          播放中 -> 封面配色 + 呼吸（{cover_layout}，"
+                  f"周期 {breathe_period:g}s，幅度 {breathe_depth:.2f}）"
+                  "  [输出端点不可用，降级]")
     else:
         print("[monitor] 媒体源不可用（缺 WinRT/Pillow），只会走麦克风指示")
     if mon.mic and mon.mic.available:
@@ -2123,8 +2218,9 @@ def run_monitor(strip: LedStrip, app_filter=None, cover_layout="spatial",
                   f" · 低于 {MIC_SOUND_GATE:g} 全灭")
     else:
         print(f"          没在播放 -> 静音 {MEDIA_FALLBACK_DELAY:g}s 后熄灯")
-    print(f"          封面呼吸亮度上限 {strip.max_level:.0%}（--max-level）；"
-          f"电平表按自己的曲线直出，固件侧 --brightness {strip.brightness}")
+    print(f"          降级呼吸走 gamma + {strip.max_level:.0%} 上限（--max-level）；"
+          f"声音驱动灯效按最终 PWM 直出（放歌峰值 {RENDER_BRIGHT_CAP * 0.8:.0%} / VU 80%）；"
+          f"固件侧 --brightness {strip.brightness}")
     if status_led:
         print("          板载 LED(GPIO2/D4)：未占用=灭 / 占用=常亮；"
               f"另切歌闪 {PULSE_TRACK} 下 / 状态切换闪 {PULSE_STATE} 下 / 失联温柔呼吸")
@@ -2186,8 +2282,8 @@ def main():
                     help=f"固件侧全局亮度 0-255（默认 {DEFAULT_BRIGHTNESS}），"
                          "8 颗满亮约 480mA，别开太高")
     ap.add_argument("--max-level", type=float, default=MAX_LEVEL, metavar="X",
-                    help=f"封面呼吸的输出上限 0~1（默认 {MAX_LEVEL:g}）。"
-                         "电平表按自己的亮度曲线直出，不受它限制")
+                    help=f"降级封面呼吸的输出上限 0~1（默认 {MAX_LEVEL:g}）。"
+                         "声音驱动灯效按自己的亮度曲线直出，不受它限制")
     ap.add_argument("--no-mic", action="store_true",
                     help="关掉麦克风指示：没播音乐就熄灯，板载 LED 也灭")
     ap.add_argument("--mic-reverse", action="store_true",
@@ -2232,6 +2328,12 @@ def main():
     ap.add_argument("--mic-calibrate", action="store_true",
                     help="采样 5 秒设备峰值，帮你校准 --mic-full-peak"
                          "（需先有应用占着麦克风并说话）")
+    ap.add_argument("--render-full-peak", type=float, default=RENDER_FULL_PEAK,
+                    metavar="X",
+                    help=f"放歌时输出峰值的满档值（默认 {RENDER_FULL_PEAK:g}）。"
+                         "灯太暗就调小；瞬态老冲满档可略调大于 1（如 1.2）压一压")
+    ap.add_argument("--render-calibrate", action="store_true",
+                    help="采样 5 秒系统播放峰值，打印最大/平均并给 --render-full-peak 建议")
     ap.add_argument("--watch", action="store_true",
                     help="配合 --diagnose 持续刷新，用来观察切歌能否跟上")
     ap.add_argument("--list-ports", action="store_true")
@@ -2247,6 +2349,10 @@ def main():
         print("当前串口：")
         for p in sorted(list_ports.comports()):
             print(f"  {p.device}   {p.description or ''}")
+        return 0
+
+    if args.render_calibrate:
+        calibrate_render()
         return 0
 
     if args.mic_calibrate:
@@ -2279,7 +2385,8 @@ def main():
                         mic=not (args.no_mic or args.no_cpu),
                         mic_reverse=args.mic_reverse,
                         status_led=not args.no_status_led,
-                        mic_full_peak=args.mic_full_peak)
+                        mic_full_peak=args.mic_full_peak,
+                        render_full_peak=args.render_full_peak)
     except KeyboardInterrupt:
         print("\n退出，熄灯。")
     finally:
