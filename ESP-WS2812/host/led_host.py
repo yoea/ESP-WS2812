@@ -6,7 +6,8 @@
 两件事，按优先级：
   1. 有音乐在播 —— 认出系统里正在播放的音乐，把专辑封面的配色铺到 8 颗灯珠上；
      **亮几颗 / 多亮由默认输出设备的实时峰值决定**（读的是系统播放混音，
-     不是麦克风），颜色仍是这 8 颗封面配色。真静音（peak 约 0）一颗都不亮，
+     不是麦克风），颜色仍是这 8 颗封面配色；采样到的黑色不会分给灯珠，
+     改用同一张封面里的其它颜色回填。真静音（peak 约 0）一颗都不亮，
      极小声从 1% 亮度起步。输出端点读不到峰值时才降级回整条呼吸。
   2. 没在播音乐 —— 麦克风没被占用：**灯带全灭、板载 LED 也灭**，完全静默；
      正在被占用：板载 LED 常亮，音量同时决定亮几颗（1~8，从最近端往最远端）、
@@ -140,6 +141,15 @@ GRID_WEIGHT = ((0.8, 1.1, 0.8),
                (1.1, 1.8, 1.1),
                (0.8, 1.1, 0.8))
 
+# ---- 去黑回填：8 颗灯里不允许出现黑色 ----
+# 判据放在「最终 PWM 域」而不是颜色名上：_normalize_values 会把纯黑抬成
+# (38,38,38) 的灰，看着不是黑，过 gamma 却只剩 (1,1,1)，肉眼就是黑灯。
+# 加饱和度条件是为了保住深蓝这类暗彩色（(20,30,60) gamma 后最大通道只有 4，
+# 但 s≈0.67）—— 它有色相，配合色相保底仍看得见，不该被当成黑替换掉。
+DARK_MAX_GAMMA = 8           # gamma 后最大通道低于此值才算「太暗」
+DARK_MAX_SAT = 0.30          # 且饱和度低于此值才算「没有色相的黑白灰」
+DARK_FALLBACK_VALUE = 0.35   # 整张封面全黑时，保留色相把明度提到这个值
+
 
 def analyze_cover(img_bytes: bytes, top: int = 5):
     """
@@ -166,8 +176,9 @@ def analyze_cover(img_bytes: bytes, top: int = 5):
                 h, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
                 if v < 0.02:                                  # 真正的纯黑才丢，其余暗部要保留
                     continue
-                # 明度是第三个维度：暗区权重适度降低（黑多 -> 多几颗暗灯），
-                # 但不清零，否则"黑色很多的封面"反而一点暗部都没有。
+                # 明度是第三个维度：暗区权重适度降低但不清零，黑色仍会进入配色候选，
+                # 免得"黑色很多的封面"一点暗部都没有；发灯前 fill_dark_leds() 会把
+                # 这些黑位换成同封面其它颜色，所以灯带上不会出现黑灯。
                 # 饱和度只做【轻微】加权（0.65~1.0）：早期用 (0.35+0.65*s) 惩罚太重，
                 # 大块白色(s=0)的权重只剩彩色的 35%，压不住反而被小面积彩色抢走。
                 score = count * w * (0.65 + 0.35 * s) * (0.40 + 0.60 * v)
@@ -1281,6 +1292,48 @@ def palette_to_leds(palette, n=LED_COUNT):
     return out[:n]
 
 
+def is_black_led(rgb):
+    """这颗灯「看起来是黑的」吗：过完 gamma 后几乎没有光、且没有色相。
+
+    判据放在最终 PWM 域，因为灯珠真正发出去的是 gamma 之后的值 ——
+    归一化后的 (38,38,38) 灰 gamma 后只剩 (1,1,1)，肉眼就是黑的。
+    饱和度高但很暗的颜色（深蓝）不算黑：它有色相，靠色相保底仍能看见。
+    """
+    if max(apply_gamma(rgb)) >= DARK_MAX_GAMMA:
+        return False
+    _, s, _ = colorsys.rgb_to_hsv(*[c / 255 for c in rgb])
+    return s < DARK_MAX_SAT
+
+
+def fill_dark_leds(base):
+    """把 8 颗里「黑灯」换成同一张封面采到的其它非黑颜色。
+
+    候选池只取这张封面真实采到的保留色（按原顺序去重），不凭空造色；
+    黑位按位置轮转取色 —— 确定性、不随机、切歌不会闪，也不会让连成一片的
+    黑区全变成同一个颜色。整张封面全黑、没有候选时，取最亮那颗保留色相
+    提亮到可见明度，8 颗统一用它（纯黑图退化为中性灰）。
+    """
+    base = list(base[:LED_COUNT])
+    while len(base) < LED_COUNT:
+        base.append(base[-1] if base else (0, 0, 0))
+    dark = [i for i, c in enumerate(base) if is_black_led(c)]
+    if not dark:
+        return base
+    pool = []
+    for i, c in enumerate(base):
+        if i not in dark and c not in pool:
+            pool.append(c)
+    if not pool:
+        brightest = max(base, key=lambda c: max(apply_gamma(c)))
+        h, s, _ = colorsys.rgb_to_hsv(*[c / 255 for c in brightest])
+        r, g, b = colorsys.hsv_to_rgb(h, s, DARK_FALLBACK_VALUE)
+        return [(round(r * 255), round(g * 255), round(b * 255))] * LED_COUNT
+    out = list(base)
+    for seq, i in enumerate(dark):
+        out[i] = pool[seq % len(pool)]
+    return out
+
+
 class LinkLost(Exception):
     """串口断链：拔线 / 睡眠唤醒 / 驱动重枚举 / 写超时"""
 
@@ -1580,13 +1633,15 @@ class Monitor:
 
     def _cover_base(self):
         """灯珠基色：spatial=按封面从左到右取色（灯带左右对应封面左右），
-        weight=按配色权重铺（主色占多颗）"""
+        weight=按配色权重铺（主色占多颗）。两条路径最后都过一遍去黑回填，
+        保证 8 颗里没有「采样到黑色、实际不发光」的灯珠。"""
         if self.cover_layout == "spatial" and self.media.columns:
             base = list(self.media.columns[:LED_COUNT])
             while len(base) < LED_COUNT:
                 base.append(base[-1])
-            return base
-        return palette_to_leds(self.media.palette)
+        else:
+            base = palette_to_leds(self.media.palette)
+        return fill_dark_leds(base)
 
     def tick(self, strip: LedStrip):
         target = self.compute_target()
@@ -2388,7 +2443,7 @@ def main():
                     help="只认某个播放器的媒体会话，例如 cloudmusic.exe")
     ap.add_argument("--cover-layout", default="spatial", choices=["spatial", "weight"],
                     help="封面取色方式：spatial 按封面从左到右(灯带左右对应封面左右，默认) / "
-                         "weight 按配色权重铺(主色占多颗)")
+                         "weight 按配色权重铺(主色占多颗)；两种都不会出现黑灯")
     ap.add_argument("--breathe-period", type=float, default=BREATHE_PERIOD, metavar="SEC",
                     help=f"呼吸周期秒数（默认 {BREATHE_PERIOD:g}）。越小呼吸越快")
     ap.add_argument("--breathe-depth", type=float, default=BREATHE_DEPTH, metavar="X",
