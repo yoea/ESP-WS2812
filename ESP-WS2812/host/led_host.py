@@ -569,6 +569,9 @@ RENDER_FULL_PEAK = 1.00      # 满档对应的输出峰值（--render-full-peak 
 # 封面配色可能是白色/浅色，8 颗全亮时电流比 VU 的饱和单色高，
 # 所以在 VU 亮度曲线上再乘一道安全系数：峰值 80% × 0.75 = 60% PWM。
 RENDER_BRIGHT_CAP = 0.75
+# 数字输出没有底噪，不能套麦克风的声音门限（0.02），否则小音量直接 0 颗全灭。
+# 放歌时至少亮 1 颗，并保一个肉眼可见的最低亮度（5% 最终 PWM，约 13/255）。
+RENDER_MIN_LEVEL = 0.05
 
 # WASAPI 设备峰值表接口。IID 后四位是 D008E73E0064 —— 网上常见的
 # D01E1FE83D21C 是错的，Activate 会直接回 0x80004002 E_NOINTERFACE。
@@ -1493,16 +1496,22 @@ class Monitor:
             # 声音驱动：颜色仍是这 8 颗封面配色，亮几颗 / 多亮交给系统输出峰值。
             # 与 VU 共用映射，只是把「绿->红」换成每颗自己的封面色，并压一道安全系数。
             lv = self.render_level.value
-            n = mic_led_count(lv)
-            bright = mic_brightness(lv) * RENDER_BRIGHT_CAP
-            self._raw_frame = True          # 1%~60% 是最终 PWM，不能再过 gamma
+            # 数字输出没有底噪：不套麦克风的声音门限，哪怕很小声也至少亮 1 颗。
+            # mic_brightness 在低段连 1% 都不到（WS2812 基本不发光），
+            # 所以再保一个可见的最低亮度；VU 那两条曲线本身不动。
+            n = 1.0 + lv * (LED_COUNT - 1)
+            bright = max(RENDER_MIN_LEVEL,
+                         mic_brightness(max(lv, MIC_SOUND_GATE)) * RENDER_BRIGHT_CAP)
+            self._raw_frame = True          # 5%~60% 是最终 PWM，不能再过 gamma
             out = [(0, 0, 0)] * LED_COUNT
             whole, frac = int(n), n - int(n)
             for i, idx in enumerate(mic_order(self.mic_reverse)):
                 if i >= whole:
                     break
-                k = bright * (frac if (i == whole - 1 and frac > 0.06) else 1.0)
-                out[idx] = scale(base[idx], k)
+                # 只有「已经亮了 2 颗以上、正在长出下一颗」才做小数渐入；
+                # 只剩 1 颗时不能把它自己削暗，否则小音量会忽明忽暗。
+                fade = frac if (whole >= 2 and i == whole - 1 and frac > 0.06) else 1.0
+                out[idx] = scale(base[idx], bright * fade)
             return out
 
         return [(0, 0, 0)] * LED_COUNT
