@@ -18,7 +18,7 @@ LastUsedTimeStart / LastUsedTimeStop），带去抖滤掉输入法那种几十�
 **只读 meter、不打开任何捕获流**，所以不会把自己写进注册表把判定污染成永远在用：
   - 放歌时读默认输出端点 (eRender/eConsole)：系统播放混音峰值，戴耳机也照样有值；
   - 麦克风 VU 读默认输入端点 (eCapture/eMultimedia)：需要别的应用占着麦克风。
-同一份 ctypes COM 代码，只是 GetDefaultAudioEndpoint 的参数不同。零第三方依赖，渲染 50Hz。
+同一份 ctypes COM 代码，只是 GetDefaultAudioEndpoint 的参数不同。零第三方依赖，渲染 100Hz。
 
 降级路径的封面呼吸受 MAX_LEVEL = 0.70（--max-level）限制，在 gamma 之前乘到每颗灯上。
 两种声音驱动灯效是例外：亮度按「最终 PWM 占空比」直出（1% 过 gamma 会全黑），
@@ -559,7 +559,7 @@ MIC_NOISE_FLOOR = 0.006      # 实测安静底噪 0.0066~0.0105，低于此不�
 # 默认吃满 WASAPI peak 的整个 0~1 物理范围：贴嘴说话不再一下打满。
 # 旧默认 0.35 只用了 1/3 量程，再叠加「lv>=0.70 就 8 颗」，实际 peak≈0.25 就到顶。
 MIC_FULL_PEAK = 1.00         # 满档对应的设备峰值（默认，可用 --mic-full-peak 改）
-MIC_LEVEL_TAU = 0.035        # 电平快平滑（50Hz 下约 2 帧），波形跟手但不抖
+MIC_LEVEL_TAU = 0.035        # 电平快平滑（100Hz 下约 3~4 帧），波形跟手但不抖
 MIC_SMOOTH_TAU = 0.035       # 声音驱动灯效的颜色平滑；全局 0.15s 会把波形削平
 
 # ---- 放歌时：系统输出峰值驱动封面配色灯 ----
@@ -620,7 +620,7 @@ class MicLevelMeter:
 
     不开捕获流是关键 —— 自己起录音会把进程写进 ConsentStore，
     于是「麦克风没在使用」永远不成立。峰值表不产生流，判定保持干净。
-    纯 ctypes，零第三方依赖；单次调用约 21.5 微秒。
+    纯 ctypes，零第三方依赖；本机实测单次调用约 41 微秒。
     """
 
     def __init__(self, data_flow=1, role=1):
@@ -1160,11 +1160,13 @@ PULSE_STATE = 3            # 状态切换（media / mic / idle 之间）
 PULSE_GUARD = 0.8
 # 事件发生后，面板上把这行字保留多久
 NOTE_HOLD = 1.5
-# 渲染帧率 50Hz：麦克风电平表要跟得上声音，25Hz 的 40ms 粒度会明显顿。
-# 串口每帧 29 字节 × 50 = 1450 B/s，只用掉 115200 的 12.6%；
-# ESP8266 刷 8 颗 WS2812 只要 0.24ms，20ms 间隔绰绰有余。
-# GetPeakValue 单次 21.5µs，50Hz 采样占 CPU 约 0.1%。
-FRAME_HZ = 50
+# 渲染帧率 100Hz：输出峰值由 Windows 音频引擎按约 10ms 的设备周期更新，
+# 50Hz 采样容易重复读同一值 / 漏掉瞬态，100Hz 才贴得上。
+# 串口每帧 29 字节 × 100 = 2900 B/s，占 115200 的 25.2%，仍很宽裕；
+# ESP8266 刷 8 颗 WS2812 只要 0.24ms，10ms 间隔绰绰有余。
+# 实测 GetPeakValue 约 41µs、整帧纯计算约 59µs，100Hz 下占 CPU 约 0.6%。
+# 所有平滑时间常数都按秒定义（或由 FRAME_INTERVAL 推导），帧率翻倍不改手感。
+FRAME_HZ = 100
 FRAME_INTERVAL = 1.0 / FRAME_HZ
 # 固件侧全局亮度。默认满档 —— 亮度限制统一交给下面的 MAX_LEVEL，
 # 固件侧不再二次打折：两道相乘会把 70% 压成 37%（128/255 × 0.70），灯明显偏暗。
@@ -1339,7 +1341,7 @@ class LedStrip:
         """板载 LED 短闪 times 下后自动熄灭 —— 事件提示（切歌 2 / 状态切换 3）。
 
         和常驻灯态不同，这里绝不能缓存：同一个事件反复发生就得反复闪。
-        闪的节奏由固件按毫秒自己走，不受主循环 50Hz 帧率的限制。"""
+        闪的节奏由固件按毫秒自己走，不受主循环 100Hz 帧率的限制。"""
         times = max(1, min(10, int(times)))
         self._write(build_frame(CMD_STATUS_PULSE, bytes([times])))
 
