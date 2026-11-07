@@ -1,0 +1,22 @@
+# ---- 运行产物：后台日志、pid、Python 缓存 ----
+logs/
+*.log
+*.pid
+__pycache__/
+*.py[cod]
+
+# ---- Arduino / esptool 编译与烧录产物 ----
+build/
+*.bin
+*.elf
+*.map
+
+# ---- 备份、临时文件 ----
+*.bak
+*.tmp
+*~
+.DS_Store
+Thumbs.db
+
+# ---- WorkBuddy 工作区数据（会话记忆，属工具数据，不入库） ----
+.workbuddy/

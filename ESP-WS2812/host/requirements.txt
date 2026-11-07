@@ -1,0 +1,21 @@
+# 音乐封面呼吸灯 - 依赖
+#
+# 装法（阿里源，已实测可用）：
+#   pip install -i https://mirrors.aliyun.com/pypi/simple --trusted-host mirrors.aliyun.com -r requirements.txt
+#
+# 注意两件事：
+#   1. 别用清华源装 winrt-*：清华源只有 2.0.0b1 预发布源码包，pip 默认跳过预发布，
+#      会报 "Could not find a version"(from versions: none)。
+#   2. 别装 winsdk：那个包已废弃，最后版只支持到 Python 3.12。
+#      现在的形态是下面这些按命名空间拆分的 winrt-* 包。
+#
+# winrt-Windows.Foundation 必须装：SMTC 的 request_async() 依赖它，
+# 缺了会抛 ModuleNotFoundError，而且异常容易被吞成"没检测到媒体会话"。
+
+pyserial>=3.5
+Pillow>=12.0
+winrt-runtime>=3.2.1
+winrt-Windows.Foundation>=3.2.1
+winrt-Windows.Foundation.Collections>=3.2.1
+winrt-Windows.Media.Control>=3.2.1
+winrt-Windows.Storage.Streams>=3.2.1
