@@ -20,3 +20,6 @@ Thumbs.db
 
 # ---- WorkBuddy 工作区数据（会话记忆，属工具数据，不入库） ----
 .workbuddy/
+
+# ---- ESP-01S 60 颗灯带项目自带独立 git 仓库，外层不重复纳管 ----
+ESP-01S-LightStrip-60/
