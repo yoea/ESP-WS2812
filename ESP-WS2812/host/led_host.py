@@ -607,6 +607,12 @@ RENDER_MIN_GLOW = 18
 # 真蓝 (20,30,60) 补完仍是 (4,5,8)，色相不会被抹掉。
 GLOW_DESAT = 0.25
 
+# 第 8 颗（最后一颗）单独延后：其它 7 颗按 n 的小数部分渐入，第 8 颗改成
+# 从 RENDER_LAST_LED_LV 到 1.0 之间线性渐入，避免太早就亮起来。
+# 0.93 -> 实际约 lv>0.934 才看得见，lv=1.0 才 8 颗全满；想更晚就调大（别到 1.0，
+# 否则又变回「必须精确满档」的硬边界），想更早调小。
+RENDER_LAST_LED_LV = 0.93
+
 # WASAPI 设备峰值表接口。IID 后四位是 D008E73E0064 —— 网上常见的
 # D01E1FE83D21C 是错的，Activate 会直接回 0x80004002 E_NOINTERFACE。
 IID_IAUDIO_METER = "C02216F6-8C67-4B5B-9D00-D008E73E0064"
@@ -1634,13 +1640,21 @@ class Monitor:
             # 小数部分必须用在「正在长出来的下一颗」上。旧写法 i < whole 只亮 whole
             # 颗，却把 frac 乘在 i==whole-1 上：面板说 7.3 颗、实际只有 7 颗，
             # 而且第 7 颗被削暗；第 8 颗要 n>=8.0（lv 精确 1.0）才可能出现。
-            # 现在 whole 颗满亮 + 第 whole 颗按 frac 渐入；frac 太小就不点亮它，
+            # 现在 whole 颗满亮 + 第 whole 颗渐入；渐入太弱就不点亮它，
             # 只剩 1 颗时也不渐入（避免极小声时自己忽明忽暗）。
-            extra = 1 if (whole >= 2 and whole < LED_COUNT and frac > 0.06) else 0
+            if whole == LED_COUNT - 1:
+                # 正要长出的是第 8 颗：单独延后，按 lv 在
+                # [RENDER_LAST_LED_LV, 1.0] 之间线性渐入，不沿用其它颗的 frac。
+                step = max(0.0, min(1.0,
+                           (lv - RENDER_LAST_LED_LV) / (1.0 - RENDER_LAST_LED_LV)))
+                extra = 1 if step > 0.06 else 0
+            else:
+                step = frac
+                extra = 1 if (whole >= 2 and whole < LED_COUNT and frac > 0.06) else 0
             for i, idx in enumerate(mic_order(self.mic_reverse)):
                 if i >= whole + extra:
                     break
-                fade = frac if (i == whole) else 1.0
+                fade = step if (i == whole) else 1.0
                 raw = scale(gamma_base[idx], bright * fade)
                 # 中暗/极暗封面色乘完亮度只剩几个 /255，补到最低可见亮度。
                 # 保底按**感知域** base[idx] 的色相比例来（不是 gamma_base）：
