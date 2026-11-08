@@ -164,6 +164,8 @@ python led_host.py --autostart install --method startup
 | `--max-level 0.70` | 降级封面呼吸的最大亮度 0~1；声音驱动灯效不受它限制 |
 | `--render-full-peak 1.00` | 放歌时输出峰值的满档值；灯太暗调小，太容易满档调大 |
 | `--render-calibrate` | 播放一首歌采样 5 秒，打印最大/平均输出峰值并给建议量程 |
+| `--render-attack 0.010` | 放歌电平**上升**时间常数秒（快起，默认 10ms）；只影响放歌，麦克风 VU 不变 |
+| `--render-release 0.070` | 放歌电平**下降**时间常数秒（慢落，默认 70ms）；调大托住峰值不闪 |
 | `--mic-full-peak 1.00` | 麦克风 VU 满档对应的输入峰值，默认吃满 WASAPI 的 0~1 物理范围 |
 | `--mic-calibrate` | 采样 5 秒输入峰值，打印最大/平均/削波占比与建议量程；识别削波会直接给降增益指引 |
 | `--no-mic` | 关掉麦克风指示，没播音乐就熄灯（板载 LED 也灭） |
@@ -213,6 +215,17 @@ python led_host.py --autostart install --method startup
 静音就是 0），颗数复用 `1 + lv×7`（lv=1.0 才满 8 颗）。唯一区别是颜色：
 不用绿→黄→橙→红，而是每颗用**自己那个位置的封面色**
 （`base[idx]`，保持灯带位置 ↔ 封面左右的对应）。
+
+**电平响应是「快起慢落」**：`render_level` 用非对称一阶低通 —— 上升
+`RENDER_LEVEL_ATTACK_TAU = 10ms`、下降 `RENDER_LEVEL_RELEASE_TAU = 70ms`
+（`--render-attack` / `--render-release` 可调）。
+`GetPeakValue` 是每 10ms 一个瞬时峰值；原来双向 35ms 低通 × 两级串联会把
+音量条那种频繁跳动整个削平 —— 离线模拟：点亮到 90% 要 **140ms**、熄灭 **130ms**，
+方波（每 100ms 在 0.9↔0.1 翻转）灯只在 10~34/255 之间慢慢晃。
+快起慢落后点亮约 **90ms**、整体更亮更稳（19~39/255），慢落托住峰值、
+不跟着波形谷值猛闪；代价是峰谷差变小（20），变化没那么「跳」。
+`tick()` 的颜色平滑仍是 **0.035s 双向**，没动；
+**麦克风 VU 仍是 `MIC_LEVEL_TAU = 35ms` 双向对称**，验收过的基线不动。
 
 **封面色必须先逐通道过 gamma 再乘亮度**：`gamma_base = apply_gamma(base)`，
 然后 `out[idx] = scale(gamma_base[idx], render_brightness(lv))`。

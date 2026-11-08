@@ -65,6 +65,8 @@ VU 峰值 80%。固件侧 --brightness 默认满档，一般别动。
     --mic-calibrate          采样 5 秒输入峰值，帮你校准 --mic-full-peak
     --render-full-peak 1.00  放歌时输出峰值满档值（灯太暗调小，太容易满档调大）
     --render-calibrate       播放一首歌采样 5 秒，给 --render-full-peak 建议
+    --render-attack 0.010    放歌电平上升时间常数秒（快起，默认 10ms）
+    --render-release 0.070   放歌电平下降时间常数秒（慢落，默认 70ms）
     --no-status-led          不用板载 LED(GPIO2/D4)做状态指示和事件提示
     --no-ui                  不画终端面板（后台运行时自动生效）
     --background             后台模式：静默运行 + 日志写 logs/led_host.log（自启时用）
@@ -593,6 +595,11 @@ RENDER_BRIGHT_FLOOR = 0.01
 # 真静音（数字输出精确为 0，没有底噪）时一颗都不亮；刚过门限的极小声仍从 1% 起步。
 # 只用来区分「完全没声音」和「有一点声音」，别调大，否则会吞掉小音量段。
 RENDER_SILENCE_GATE = 0.005
+# 放歌电平低通：标准 VU 的「快起慢落」。上升 10ms 让峰值顶得上去，
+# 下降 70ms 托住峰值、不跟着波形谷值猛闪。麦克风 VU 不用这套，
+# 仍走 MIC_LEVEL_TAU 双向 35ms（验收过的基线）。
+RENDER_LEVEL_ATTACK_TAU = 0.010
+RENDER_LEVEL_RELEASE_TAU = 0.070
 # 暗封面色过 gamma 后往往只剩 4~19/255，再乘约 0.35 的亮度系数就只有 3~5/255：
 # 逻辑上点亮了、肉眼却看不见（表现为「前两颗不亮，从第三颗才亮」）。
 # with_glow() 按自身色相比例把最终 PWM 补到这个「最低可见亮度」。
@@ -766,11 +773,16 @@ class MicLevel:
     正常说话就会立刻变成 target=1.0（8 颗全亮），这正是之前那个 bug。
     """
 
-    def __init__(self, full_peak=MIC_FULL_PEAK, noise_floor=MIC_NOISE_FLOOR):
+    def __init__(self, full_peak=MIC_FULL_PEAK, noise_floor=MIC_NOISE_FLOOR,
+                 attack_tau=MIC_LEVEL_TAU, release_tau=MIC_LEVEL_TAU):
         self.value = 0.0        # 平滑后的电平，灯效读这个
         self.peak = 0.0         # 本次原始峰值，面板显示
         self.noise_floor = float(noise_floor)
         self.full = max(self.noise_floor + 1e-3, float(full_peak))   # 满档峰值
+        # 默认 attack == release == MIC_LEVEL_TAU，麦克风 VU 行为完全不变；
+        # 只有放歌的 render_level 传「快起慢落」两个不同的 tau。
+        self.attack_tau = max(1e-4, float(attack_tau))
+        self.release_tau = max(1e-4, float(release_tau))
         self._last = None
 
     def update(self, peak, now=None, dt=None):
@@ -782,7 +794,9 @@ class MicLevel:
         self.peak = peak
         span = max(1e-6, self.full - self.noise_floor)
         target = min(1.0, max(0.0, peak - self.noise_floor) / span)
-        k = 1.0 - math.exp(-dt / MIC_LEVEL_TAU)
+        # 非对称：上升用 attack、下降用 release（两者相等时就是原来的双向低通）
+        tau = self.attack_tau if target > self.value else self.release_tau
+        k = 1.0 - math.exp(-dt / tau)
         self.value += (target - self.value) * k
         # 吸附：一阶低通永远差一点点，不处理的话最大声会停在「7 颗 + 第 8 颗 99.9% 亮」
         if abs(target - self.value) < 1e-3:
@@ -1530,7 +1544,9 @@ class Monitor:
     def __init__(self, app_filter=None, cover_layout="spatial",
                  breathe_period=BREATHE_PERIOD, breathe_depth=BREATHE_DEPTH,
                  mic=True, mic_reverse=False, status_led=True,
-                 mic_full_peak=MIC_FULL_PEAK, render_full_peak=RENDER_FULL_PEAK):
+                 mic_full_peak=MIC_FULL_PEAK, render_full_peak=RENDER_FULL_PEAK,
+                 render_attack_tau=RENDER_LEVEL_ATTACK_TAU,
+                 render_release_tau=RENDER_LEVEL_RELEASE_TAU):
         self.cover_layout = cover_layout
         self.breathe_period = max(0.2, breathe_period)
         self.breathe_depth = max(0.0, min(1.0, breathe_depth))
@@ -1550,7 +1566,8 @@ class Monitor:
         self.level = MicLevel(mic_full_peak) if mic else None
         # 放歌时读系统输出峰值：与麦克风完全独立，--no-mic 也照常可用
         self.render_meter = MicLevelMeter(0, 0)
-        self.render_level = MicLevel(render_full_peak, RENDER_NOISE_FLOOR)
+        self.render_level = MicLevel(render_full_peak, RENDER_NOISE_FLOOR,
+                                     render_attack_tau, render_release_tau)
         self.mic_reverse = bool(mic_reverse)
         self._raw_frame = False      # 电平表按最终 PWM 直出；其它灯效走 gamma
         self.state = "media"
@@ -1888,7 +1905,9 @@ def _runtime_args(args):
              "--breathe-period", f"{args.breathe_period:g}",
              "--breathe-depth", f"{args.breathe_depth:g}",
              "--mic-full-peak", f"{args.mic_full_peak:g}",
-             "--render-full-peak", f"{args.render_full_peak:g}"]
+             "--render-full-peak", f"{args.render_full_peak:g}",
+             "--render-attack", f"{args.render_attack_tau:g}",
+             "--render-release", f"{args.render_release_tau:g}"]
     if args.app_filter:
         parts += ["--app-filter", str(args.app_filter)]
     if args.no_mic or args.no_cpu:
@@ -2365,9 +2384,12 @@ def diagnose(watch=False, full_peak=MIC_FULL_PEAK):
 def run_monitor(strip: LedStrip, app_filter=None, cover_layout="spatial",
                 ui=True, breathe_period=BREATHE_PERIOD, breathe_depth=BREATHE_DEPTH,
                 mic=True, mic_reverse=False, status_led=True,
-                mic_full_peak=MIC_FULL_PEAK, render_full_peak=RENDER_FULL_PEAK):
+                mic_full_peak=MIC_FULL_PEAK, render_full_peak=RENDER_FULL_PEAK,
+                render_attack_tau=RENDER_LEVEL_ATTACK_TAU,
+                render_release_tau=RENDER_LEVEL_RELEASE_TAU):
     mon = Monitor(app_filter, cover_layout, breathe_period, breathe_depth,
-                  mic, mic_reverse, status_led, mic_full_peak, render_full_peak)
+                  mic, mic_reverse, status_led, mic_full_peak, render_full_peak,
+                  render_attack_tau, render_release_tau)
     if mon.media.available:
         print("[monitor] 音乐封面呼吸灯")
         if mon.render_meter.available:
@@ -2375,6 +2397,8 @@ def run_monitor(strip: LedStrip, app_filter=None, cover_layout="spatial",
                   f"满档 {render_full_peak:g}，颗数/亮度随音量）")
             print(f"          真静音 peak<{RENDER_SILENCE_GATE:g} 全灭；"
                   f"极小声从 {RENDER_BRIGHT_FLOOR:.0%} 起步")
+            print(f"          电平响应 快起 {render_attack_tau*1000:.0f}ms / "
+                  f"慢落 {render_release_tau*1000:.0f}ms（麦克风 VU 仍 35ms 双向）")
         else:
             print(f"          播放中 -> 封面配色 + 呼吸（{cover_layout}，"
                   f"周期 {breathe_period:g}s，幅度 {breathe_depth:.2f}）"
@@ -2511,6 +2535,14 @@ def main():
                          "灯太暗就调小；瞬态老冲满档可略调大于 1（如 1.2）压一压")
     ap.add_argument("--render-calibrate", action="store_true",
                     help="采样 5 秒系统播放峰值，打印最大/平均并给 --render-full-peak 建议")
+    ap.add_argument("--render-attack", type=float, default=RENDER_LEVEL_ATTACK_TAU,
+                    dest="render_attack_tau", metavar="SEC",
+                    help=f"放歌电平上升时间常数秒（默认 {RENDER_LEVEL_ATTACK_TAU:g}）。"
+                         "调小更跟手、调大更稳；麦克风 VU 不受影响")
+    ap.add_argument("--render-release", type=float, default=RENDER_LEVEL_RELEASE_TAU,
+                    dest="render_release_tau", metavar="SEC",
+                    help=f"放歌电平下降时间常数秒（默认 {RENDER_LEVEL_RELEASE_TAU:g}）。"
+                         "调大托住峰值不闪、调小灭得更快")
     ap.add_argument("--watch", action="store_true",
                     help="配合 --diagnose 持续刷新，用来观察切歌能否跟上")
     ap.add_argument("--list-ports", action="store_true")
@@ -2563,7 +2595,9 @@ def main():
                         mic_reverse=args.mic_reverse,
                         status_led=not args.no_status_led,
                         mic_full_peak=args.mic_full_peak,
-                        render_full_peak=args.render_full_peak)
+                        render_full_peak=args.render_full_peak,
+                        render_attack_tau=args.render_attack_tau,
+                        render_release_tau=args.render_release_tau)
     except KeyboardInterrupt:
         print("\n退出，熄灯。")
     finally:
