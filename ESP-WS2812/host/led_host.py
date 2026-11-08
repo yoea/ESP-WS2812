@@ -1161,7 +1161,9 @@ class Display:
         rm = getattr(mon, "render_meter", None)
         if st == "media" and rm and rm.available:
             lv = mon.render_level.value
-            L.append(self._row(f"输出 {mic_led_count(lv):.1f}/{LED_COUNT} 颗  "
+            # 放歌不套麦克风 VU 的 0.02 声音门限，颗数直接按 1 + lv×7 显示；
+            # 用 mic_led_count() 会在极低音量显示「0.0 颗」而实际亮着 1 颗。
+            L.append(self._row(f"输出 {1.0 + lv * (LED_COUNT - 1):.1f}/{LED_COUNT} 颗  "
                                f"亮度 {render_brightness(lv):.0%}  "
                                f"峰值 {mon.render_level.peak:.3f}"))
         if frame:
@@ -1629,12 +1631,16 @@ class Monitor:
             glow_level = RENDER_MIN_GLOW * bright / RENDER_BRIGHT_MAX
             out = [(0, 0, 0)] * LED_COUNT
             whole, frac = int(n), n - int(n)
+            # 小数部分必须用在「正在长出来的下一颗」上。旧写法 i < whole 只亮 whole
+            # 颗，却把 frac 乘在 i==whole-1 上：面板说 7.3 颗、实际只有 7 颗，
+            # 而且第 7 颗被削暗；第 8 颗要 n>=8.0（lv 精确 1.0）才可能出现。
+            # 现在 whole 颗满亮 + 第 whole 颗按 frac 渐入；frac 太小就不点亮它，
+            # 只剩 1 颗时也不渐入（避免极小声时自己忽明忽暗）。
+            extra = 1 if (whole >= 2 and whole < LED_COUNT and frac > 0.06) else 0
             for i, idx in enumerate(mic_order(self.mic_reverse)):
-                if i >= whole:
+                if i >= whole + extra:
                     break
-                # 只有「已经亮了 2 颗以上、正在长出下一颗」才做小数渐入；
-                # 只剩 1 颗时不能把它自己削暗，否则小音量会忽明忽暗。
-                fade = frac if (whole >= 2 and i == whole - 1 and frac > 0.06) else 1.0
+                fade = frac if (i == whole) else 1.0
                 raw = scale(gamma_base[idx], bright * fade)
                 # 中暗/极暗封面色乘完亮度只剩几个 /255，补到最低可见亮度。
                 # 保底按**感知域** base[idx] 的色相比例来（不是 gamma_base）：
