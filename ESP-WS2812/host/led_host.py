@@ -54,7 +54,7 @@ VU 峰值 80%。固件侧 --brightness 默认满档，一般别动。
     python led_host.py --autostart remove        # 彻底卸掉自启
 
 常用参数：
-    --port COM4              串口号
+    --port COM6              串口号
     --max-level 0.70         封面呼吸灯珠最大亮度 0~1（默认 0.70）
     --brightness 255         固件侧二次亮度（默认满档，一般不改）
     --breathe-period 4.0     呼吸周期（秒），越小呼吸越快
@@ -2477,7 +2477,7 @@ def run_monitor(strip: LedStrip, app_filter=None, cover_layout="spatial",
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="COM4")
+    ap.add_argument("--port", default="COM6")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--brightness", type=int, default=DEFAULT_BRIGHTNESS,
                     help=f"固件侧全局亮度 0-255（默认 {DEFAULT_BRIGHTNESS}），"

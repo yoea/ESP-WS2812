@@ -159,7 +159,7 @@ python led_host.py --autostart install --method startup
 
 | 参数 | 说明 |
 |---|---|
-| `--port COM4` | 串口号 |
+| `--port COM6` | 串口号 |
 | `--baud 115200` | 波特率 |
 | `--max-level 0.70` | 降级封面呼吸的最大亮度 0~1；声音驱动灯效不受它限制 |
 | `--render-full-peak 1.00` | 放歌时输出峰值的满档值；灯太暗调小，太容易满档调大 |

@@ -26,7 +26,7 @@
     注意：arduino-cli 的 -t/--verify 在本 core 的 recipe 里没有被引用，是空转的，
     所以校验由 esptool 自己完成，脚本会解析上传输出确认校验痕迹。
 
-  COM 口不写死：从 PnP 里的 CH340 自动探测（当前是 COM4）。也可用 -Port 覆盖。
+  COM 口不写死：从 PnP 里的 CH340 自动探测（当前是 COM6）。也可用 -Port 覆盖。
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File "D:\Develope\esp8266\3.WeMOS D1 mini\ESP-WS2812\flash.ps1"
