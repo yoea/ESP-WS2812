@@ -1,24 +1,43 @@
 /*
- * WeMOS D1 mini 电脑状态指示灯 - 固件端（哑终端）
+ * WeMOS D1 mini 60 颗音乐电平灯带 - 固件端（哑终端），固件版本 v6
  *
- * 职责：只负责把串口收到的 24 字节变成光，不含任何业务逻辑。
- * 所有策略（配色、优先级、平滑）都在电脑端 Python 里做，改灯效不用重新烧录。
+ * 从 ESP-01S-LightStrip-60/ESP-01S-LightStrip-60.ino（v6）原样移植，
+ * 只改「跑在哪块板子上」相关的东西，协议、灯效策略、保护机制全部一致。
+ *
+ * 与 ESP-01S 版的差异（仅硬件相关）：
+ *   - 板子：WeMOS D1 mini（ESP8266EX，4MB flash），不再是 ESP-01S 1MB 小座子
+ *   - 信号脚 GPIO0 -> GPIO4，即板子丝印 D2：
+ *       * GPIO0 是 strapping 引脚，上电被拉低就会进下载模式，挂长线还容易被干扰，
+ *         所以 D1 mini 上把数据线接到 D2（GPIO4）这个普通 IO。
+ *       * 60 颗 WS2812 数据线接 D2，GND 与灯带共地，5V 从 D1 mini 的 5V/VIN 取。
+ *   - 板载 LED 仍是 GPIO2（丝印 D4），低电平点亮，可以正常控制：
+ *       常驻灯态 0x07、事件脉冲 0x08、主机失联 PWM 呼吸都保留，
+ *       与数据脚 GPIO4 完全独立，互不干扰。
+ *   - 设备身份证的型号字符串改成 "D1MINI-LED60"（12 字节，与 ESP-01S 的
+ *     "ESP01S-LED60" 等长），电脑端靠它区分「这次接的是哪块板」。
+ *     芯片唯一序列号（ESP.getChipId()）不变，仍由固件自报，烧录时不用手填。
+ *
+ * 电脑端发 60 组 RGB（180B），**每颗灯珠单独一个颜色**；帧长 185B @50Hz
+ *   = 92.5kbit/s，占 115200 的 80.3%（100Hz 会超带宽，所以必须 50Hz）
+ * 全局亮度硬限 128/255 = 50%，防止 60 颗灯带过流
+ * FIRMWARE_VERSION 6，握手时上报 + 17B 身份帧，避免旧固件 / 别的设备误配
  *
  * 帧格式： A5 5A | CMD | LEN | PAYLOAD[LEN] | CRC8
  *   CRC8 覆盖 CMD + LEN + PAYLOAD，多项式 0x07，初值 0x00
  *
  * 命令：
- *   0x01 SET_ALL      payload 24B，RGB 顺序，一次设定 8 颗灯珠
- *   0x03 BRIGHTNESS   payload 1B，全局亮度 0-255
+ *   0x01 SET_ALL      payload 180B，RGB 顺序，第 i 颗 = payload[i*3 .. i*3+2]
+ *   0x03 BRIGHTNESS   payload 1B，全局亮度 0-255（固件 clamp 到 128）
  *   0x04 HEARTBEAT    payload 0B
  *   0x06 OFF          payload 0B，立即熄灭
  *   0x07 STATUS_LED   payload 1B，板载 LED 常驻灯态：0=灭 1=常亮 2=慢闪
  *   0x08 STATUS_PULSE payload 1B，板载 LED 短闪几下后自动熄灭（事件提示）
- *   0x10 HANDSHAKE    payload 0B，回应固件版本号，用于电脑端确认固件匹配
+ *   0x10 HANDSHAKE    payload 0B，回应 17B 身份帧：
+ *                     [0]=版本 [1..12]="D1MINI-LED60" [13..16]=芯片ID(小端)
  *
  * 板载 LED（GPIO2 / D4，低电平点亮）—— 只在「有事发生」时出声。
- * 「在放歌 / 在跑 CPU 条」这两件事 8 颗灯珠已经说得很清楚了，这颗灯再复述一遍
- * 纯属打扰，所以主机端平时根本不点它，只在事件瞬间发一条脉冲：
+ * 「在放歌」这件事 60 颗灯珠已经说得很清楚了，这颗灯再复述一遍纯属打扰，
+ * 所以主机端平时根本不点它，只在事件瞬间发一条脉冲：
  *   切歌      闪 2 下（0x08 payload=2）
  *   状态切换  闪 3 下（0x08 payload=3）
  * 脉冲结束自动回到熄灭，其余时间全灭。
@@ -28,6 +47,9 @@
  *   主机主动退出会先发 OFF，这时保持熄灭 —— 手动关掉不误报。
  *   上电后主机一直没连上，同样会进入呼吸，表示「固件在跑但没人在推数据」。
  *   进入呼吸前会等灯带渐灭走完：PWM 一开就不能再 show()，顺序不能反。
+ * 灯带本身是 fail-safe 全灭：pixels 上电先 clear，CMD_BRIGHTNESS 也先 clear，
+ *   任何「只恢复亮度」的帧都不会把关机前的旧颜色点亮。开机 / 待机 / 唤醒
+ *   没人推 SET_ALL 时灯带一律是黑的，不依赖 Windows 在关机瞬间发 OFF。
  *
  * 为什么这里敢用 analogWrite：ESP8266 的 PWM 靠定时器中断实现，会打断 WS2812 的
  * 软件位翻转 —— 但呼吸只在「主机已经不发数据」的窗口里启用，这段时间一次
@@ -43,13 +65,15 @@
 #include <Adafruit_NeoPixel.h>
 #include <ESP8266WiFi.h>
 
-#define LED_PIN    4          // D2（已从 GPIO0 迁出：GPIO0 是 strapping 引脚，上电被拉低会进下载模式）
-#define LED_COUNT  8
-#define BAUD_RATE  115200
+// D1 mini 丝印 D2 = GPIO4：普通 IO，不参与 strapping，也不会被串口占用。
+// 别改回 GPIO0 —— 那是下载模式引脚，上电被拉低就起不来。
+#define LED_PIN    4          // D2 / GPIO4，接灯带 DIN
+#define LED_COUNT  60         // 物理灯珠数 = 电脑端发来的颜色数（逐颗独立控色）
+#define BAUD_RATE  115200     // 185B/帧 @50Hz = 92.5kbit/s，占 115200 的 80.3%
 
 #define HDR0              0xA5
 #define HDR1              0x5A
-#define MAX_PAYLOAD       32
+#define MAX_PAYLOAD       192  // 60 颗 x 3B = 180B，留 12B 余量
 #define FRAME_TIMEOUT_MS  100
 #define HEARTBEAT_TIMEOUT 3000
 #define FADE_STEP_MS      60
@@ -63,10 +87,17 @@
 #define CMD_STATUS_PULSE 0x08
 #define CMD_HANDSHAKE  0x10
 
-#define FIRMWARE_VERSION 3
+#define FIRMWARE_VERSION 6
+// 设备身份证：型号字符串 + ESP8266 芯片唯一 ID。主机靠它认灯带，不靠 COM 号。
+// "D1MINI-LED60" = 12 字节，与 ESP-01S 版的 "ESP01S-LED60" 等长，
+// 所以 IDENTITY_LEN 仍是 17，电脑端解析代码一行都不用改结构。
+#define DEVICE_MODEL     "D1MINI-LED60"   // 12 字节，不含结尾 '\0'
+#define DEVICE_MODEL_LEN 12
+#define IDENTITY_LEN     17               // 1B 版本 + 12B 型号 + 4B 芯片ID
+#define BRIGHTNESS_CAP   128  // 硬限 50%：60 颗灯带不许超过这个全局亮度
 
-// ---- 板载 LED ----
-#define STATUS_LED_PIN   2      // D4 / GPIO2，与灯带数据脚(D2/GPIO4)无关
+// ---- 板载 LED（D1 mini 板载蓝灯，丝印 D4 = GPIO2，低电平点亮）----
+#define STATUS_LED_PIN   2      // GPIO2 / D4 板载蓝灯，与数据脚 GPIO4 独立
 #define STATUS_OFF       0
 #define STATUS_ON        1
 #define STATUS_BLINK     2
@@ -246,6 +277,9 @@ void handleFrame(uint8_t cmd, const uint8_t *payload, uint8_t len) {
   switch (cmd) {
     case CMD_SET_ALL: {
       if (len < LED_COUNT * 3) return;
+      // 60 颗逐颗独立控色，第 i 颗直接用 payload[i*3 .. i*3+2]。
+      // 相邻灯珠可以完全不同色，不做任何「每组复制到相邻几颗」。
+      // 60 颗 show() 约 1.8ms 关中断，115200 下只落 ~21 字节进 UART FIFO，安全。
       for (uint8_t i = 0; i < LED_COUNT; i++) {
         strip.setPixelColor(i, strip.Color(payload[i * 3],
                                            payload[i * 3 + 1],
@@ -264,9 +298,17 @@ void handleFrame(uint8_t cmd, const uint8_t *payload, uint8_t len) {
 
     case CMD_BRIGHTNESS: {
       if (len < 1) return;
-      targetBrightness = payload[0];
+      // 硬限 50%：电脑端发 255 也只到 128，防止 60 颗灯带过流。
+      // 只 clamp 这一处，不再叠加别的折扣，避免两道相乘把亮度压没。
+      // ★ 亮度帧绝不能点亮旧数据：关机 / 待机时 USB 还有电、固件不重启，
+      //   渐灭只把 currentLevel 压到 0，pixels 里仍留着最后一帧颜色。
+      //   以前这里直接 setBrightness + show()，开机第一条 CMD_BRIGHTNESS
+      //   就把关机前那颗灯原样复活了（「开机后中间莫名其妙亮一颗」的真凶）。
+      //   先 clear 再 show：真正的颜色一律由紧随其后的 CMD_SET_ALL 给。
+      targetBrightness = min(payload[0], (uint8_t)BRIGHTNESS_CAP);
       currentLevel = targetBrightness;
       fading = false;
+      strip.clear();
       strip.setBrightness(currentLevel);
       strip.show();
       break;
@@ -300,8 +342,19 @@ void handleFrame(uint8_t cmd, const uint8_t *payload, uint8_t len) {
     }
 
     case CMD_HANDSHAKE: {
-      uint8_t ver = FIRMWARE_VERSION;
-      sendFrame(CMD_HANDSHAKE, &ver, 1);
+      // 每次握手都自报身份：版本 + 型号 + 芯片唯一序列号。
+      // 主机换了 USB 口 / 同时插着多个 CH340 时，靠这 17B 认出本灯带；
+      // 型号 D1MINI-LED60 还能区分「这是 D1 mini 的 60 颗，不是 ESP-01S 的」。
+      uint8_t id[IDENTITY_LEN];
+      memset(id, 0, sizeof(id));
+      id[0] = FIRMWARE_VERSION;
+      memcpy(id + 1, DEVICE_MODEL, DEVICE_MODEL_LEN);
+      uint32_t chip = ESP.getChipId();       // 每片 ESP8266 唯一，不用烧录时手填
+      id[13] = (uint8_t)(chip & 0xFF);
+      id[14] = (uint8_t)((chip >> 8) & 0xFF);
+      id[15] = (uint8_t)((chip >> 16) & 0xFF);
+      id[16] = (uint8_t)((chip >> 24) & 0xFF);
+      sendFrame(CMD_HANDSHAKE, id, IDENTITY_LEN);
       break;
     }
   }
@@ -318,6 +371,9 @@ void setup() {
   Serial.begin(BAUD_RATE);
 
   strip.begin();
+  // begin() 里 malloc 出来的 pixels 缓冲区不保证清零，第一次 show() 之前
+  // 必须先 clear()，否则上电瞬间会闪一下随机颜色的灯珠。
+  strip.clear();
   strip.setBrightness(targetBrightness);
   strip.show();
 
