@@ -5,9 +5,10 @@ WeMOS D1 mini 60 颗音乐电平灯带 —— 唯一控制脚本（一个进程 
 
 ★ 源自 ESP-WS2812/host/led_host.py @ 19973c3 的 fork，现在只维护这一份。
   只管一条 60 颗灯带（v6 固件，50Hz / 185B 逐颗独立控色帧）。
-  固件有两个硬件变体，协议完全一致，本脚本都认（见 DEVICE_MODELS）：
-    D1MINI-LED60  WeMOS D1 mini 数据脚 D2/GPIO4  ../ESP-WS2812/ESP-WS2812.ino   ← 当前在用
-    ESP01S-LED60  ESP-01S      数据脚 GPIO0    ../ESP-01S-LightStrip-60/（已归档，仅留档）
+  板子：WeMOS D1 mini（数据脚 D2/GPIO4），固件就是本目录的 ESP-WS2812.ino，
+  型号字符串 "D1MINI-LED60"。历史上还用过 ESP-01S（型号 "ESP01S-LED60"，
+  数据脚 GPIO0），协议完全一致所以 DEVICE_MODELS 里仍然兼容它，但板子与固件
+  已归档到 ../ESP-01S-LightStrip-60/，不再维护。
   串口既不写死也不靠「谁先枚举到」：逐个端口发握手帧，靠固件自报的
   「型号 + 芯片序列号」认灯带。首次连接时把序列号记进 host/device.json
   （只有一台就自动记住，多台会问你要哪台），以后只认这一个序列号 ——
@@ -1491,11 +1492,12 @@ CMD_STATUS_PULSE = 0x08
 # 身份帧：[0]=版本 [1..12]=型号 [13..16]=芯片ID(小端)。
 # 主机逐个串口探测，只认型号匹配的那个，所以不用写死 COM 号。
 EXPECTED_FIRMWARE = 6
-# 同一套协议跑在两块板子上，固件只差「数据脚」和型号字符串，主机两个都认：
-#   ESP01S-LED60  ESP-01S     数据脚 GPIO0
-#   D1MINI-LED60  WeMOS D1 mini 数据脚 D2 / GPIO4
+# 现役板子：WeMOS D1 mini（数据脚 D2 / GPIO4），型号字符串 "D1MINI-LED60"。
+# 历史还有一块 ESP-01S（数据脚 GPIO0，型号 "ESP01S-LED60"）：协议逐字节相同，
+# 所以仍然认它，插回来灯效照常；那块板子和固件已归档，不再维护。
 # 型号必须是 12 字节（IDENTITY_LEN 才是 17）；加新板子只要往这里追加一条。
-DEVICE_MODELS = (b"ESP01S-LED60", b"D1MINI-LED60")
+# 顺序有意义：第 0 条是「识别不到设备时」的兜底显示名，所以现役板子放最前。
+DEVICE_MODELS = (b"D1MINI-LED60", b"ESP01S-LED60")
 DEVICE_MODEL_LEN = 12
 DEVICE_MODEL = DEVICE_MODELS[0]       # 兜底显示用：识别不到设备时的默认型号名
 IDENTITY_LEN = 17
@@ -1573,8 +1575,9 @@ def build_frame(cmd: int, payload: bytes = b"") -> bytes:
 def parse_identity(payload):
     """解析握手回应；不匹配返回 None（不误连别的设备）。
 
-    v6 = 17B 完整身份帧（型号 + 芯片序列号），型号在 DEVICE_MODELS 里任一条都认
-    —— ESP-01S 和 D1 mini 的固件协议完全一致，只有型号字符串和数据脚不同。
+    v6 = 17B 完整身份帧（型号 + 芯片序列号），型号在 DEVICE_MODELS 里任一条都认。
+    现役是 D1 mini（D1MINI-LED60）；旧的 ESP-01S（ESP01S-LED60）协议逐字节相同，
+    只是型号字符串和数据脚不同，所以仍兼容，插回来也不会被误判成陌生设备。
     v5 = 只回 1B 版本号：为了「还没烧 v6 的板子插回来也能正常亮灯」而兼容，
     但标 legacy=True，Web 会提示烧录后才有自动识别串口的能力。
     """
@@ -2064,7 +2067,7 @@ class LedStrip:
                             if self.verbose:
                                 print(f"  [警告] {self.port_name} 是 v5 固件，"
                                       "没有设备身份证；自动识别串口不可用，"
-                                      "请跑 flash_esp01s.ps1 烧 v6")
+                                      "请跑 flash_d1mini.ps1 烧 v6")
                         elif self.verbose:
                             print(f"  握手成功：{dev['model']} v{dev['version']} "
                                   f"序列号 {dev['serial']} @ {self.port_name}")
@@ -2653,8 +2656,16 @@ def _decode(b):
 
 
 def _schtasks(args):
-    """schtasks 中文输出是 GBK，统一解码后再看"""
-    p = subprocess.run(["schtasks"] + args, capture_output=True)
+    """schtasks 中文输出是 GBK，统一解码后再看。
+
+    被组策略 / 安全软件拉黑时连进程都起不来（subprocess 直接抛 OSError），
+    这里兜住并返回非 0 —— 调用方一律按「任务没注册」降级处理，
+    不能让 --autostart status/start/stop 整个崩在 traceback 上。
+    """
+    try:
+        p = subprocess.run(["schtasks"] + args, capture_output=True)
+    except OSError as e:
+        return 1, "", f"schtasks 不可用：{e}"
     return p.returncode, _decode(p.stdout), _decode(p.stderr)
 
 
@@ -2780,7 +2791,7 @@ def _print_installed(how, task=True):
     print(f"  方式  ：{how}")
     if task:
         print(f"  任务名：{TASK_NAME}")
-        print("          任务计划程序库里能看到，点开「描述」就知道它管哪两条灯带")
+        print("          任务计划程序库里能看到，点开「描述」就知道它管哪条灯带")
         print("  触发  ：登录后 20 秒（等 USB 枚举完）")
     else:
         print(f"  启动器：{_startup_vbs_path()}")
@@ -2801,8 +2812,9 @@ def _install_startup_vbs(pyw, args_line):
         "' ESP-WS2812 60颗音乐灯带 —— 开机自启启动器\r\n"
         "' 本文件由 led_host_60.py 自动生成，改参数请重新跑 --autostart install，别手改这里。\r\n"
         "'\r\n"
-        "' 作用：登录 Windows 后无窗口启动 led_host_60.py，让 COM7 上的 60 颗 WS2812B\r\n"
+        "' 作用：登录 Windows 后无窗口启动 led_host_60.py，让 60 颗 WS2812B\r\n"
         "'       跟着当前播放音乐的电平与封面配色变化；音乐停 1.5 秒后熄灯。\r\n"
+        "'       串口不写死：按 device.json 里绑定的芯片序列号自动找板子。\r\n"
         f"' 主脚本：{os.path.join(BASE_DIR, 'led_host_60.py')}\r\n"
         f"' 日志  ：{LOG_PATH}\r\n"
         "' 临时停：python led_host_60.py --autostart stop\r\n"
@@ -3089,7 +3101,7 @@ def cmd_select_device(port_arg=""):
 
     if not dev.get("serial"):
         print("这块是 v5 固件，没有身份证，没法按序列号绑定；"
-              "先跑 flash_esp01s.ps1 烧 v6 再来。")
+              "先跑 flash_d1mini.ps1 烧 v6 再来。")
         return 1
     if not save_device_profile(dev, dev["port"]):
         return 1
@@ -3115,7 +3127,7 @@ def cmd_forget_device():
 
 
 # ============================================================
-# 空闲模式 + 本地控制面板（COM7 的 60 颗）
+# 空闲模式 + 本地控制面板（60 颗灯带）
 # ============================================================
 # 后台是 pythonw，没有控制台 / 窗口，热键和 stdin 都不可靠。用「配置文件 +
 # 进程内 HTTP 面板」：选择写 idle_state.json（重启保持），面板线程只改内存里的
