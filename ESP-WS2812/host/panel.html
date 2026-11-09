@@ -263,7 +263,7 @@ const PREVIEW = {
     const c = [Math.floor(b[0] * (1 - .55 * f)),
                Math.floor(b[1] * (1 - .85 * f)),
                Math.floor(b[2] * (1 - .95 * f))];
-    return tone(c, Math.pow(.5, k) * GAIN.comet);
+    return tone(c, Math.pow(.75, k) * GAIN.comet);
   },
   wave:     (t, i, n) => {
     const x = i / (n - 1), w = .5 + .5 * Math.sin(2 * Math.PI * (x * 2 - t * .35));
