@@ -54,6 +54,8 @@ h1{font-size:23px;font-weight:600;letter-spacing:-.4px;margin:0;
               animation:linkpulse 1.6s ease-in-out infinite}
 @keyframes linkpulse{0%,100%{box-shadow:0 0 0 0 rgba(255,80,80,0)}50%{box-shadow:0 0 0 5px rgba(255,80,80,.13)}}
 .lrow{display:flex;gap:10px;padding:8px 0;border-bottom:1px solid var(--line);font-size:12.5px}
+/* display:flex 会盖掉浏览器给 [hidden] 的 display:none，必须自己补一条 */
+.lrow[hidden]{display:none}
 .lrow .k{color:var(--dim);min-width:80px;flex:none}
 .lrow .v{color:var(--txt);word-break:break-all;flex:1}
 pre.lpre{margin:12px 0 0;padding:11px 13px;background:rgba(0,0,0,.32);
@@ -494,31 +496,69 @@ let LINK = {state: "up", port: "", error: "", since: "", attempts: 0,
 
 function fillLinkDetail() {
   const l = LINK;
+  const up = l.state === "up";
   const names = {up: "正常", retry: "断开，正在自动重连", down: "连接失败 / 已放弃重连"};
-  const set = (id, v) => { document.getElementById(id).textContent = v; };
-  set("lkState", names[l.state] || l.state || "—");
-  set("lkPort", l.port || "—");
+
+  // 一行一个字段：值为空就整行藏掉，不占位也不显示「—」
+  const put = (id, v) => {
+    const el = document.getElementById(id);
+    const row = el.closest(".lrow");
+    const text = (v === null || v === undefined) ? "" : String(v).trim();
+    const empty = !text || text === "—";
+    if (row) row.hidden = empty;
+    el.textContent = empty ? "" : text;
+    return !empty;
+  };
+  const hideRow = id => {
+    const el = document.getElementById(id);
+    const row = el.closest(".lrow");
+    if (row) row.hidden = true;
+  };
+
+  put("lkState", names[l.state] || l.state);
+  put("lkPort", l.port);
+
   const d = l.device || {};
-  set("lkDevice", d.model
+  put("lkDevice", d.model
       ? (d.legacy
          ? "固件 v5 · 未烧录身份证（烧 v6 后可自动识别串口）"
          : (d.model + " · 固件 v" + d.version + " · 序列号 " + d.serial))
-      : "（未识别到设备）");
+      : "");
+
   const p = l.profile || {};
-  set("lkBind", p.serial
-      ? ("序列号 " + p.serial + (p.port ? "（上次在 " + p.port + "）" : "")
-         + " · 只看这一台，换 USB 口也认")
-      : "未绑定 · 首次连接时只有一台会自动记住，多台会询问");
-  set("lkSince", l.since || "—");
-  set("lkAttempts", (l.attempts || 0) + " 次");
-  set("lkDelay", l.next_delay ? (l.next_delay + " 秒后") : "—");
-  set("lkError", l.error || "—");
-  set("lkPorts", (l.ports || []).join("、") || "（未检测到串口）");
-  set("lkDetail", "最近重试记录：\n" + ((l.history || []).join("\n") || "（无）")
-                  + "\n\n" + (l.detail || ""));
-  set("linkSummary", l.state === "up"
-      ? "灯带与固件通信正常。这里可以随时查看当前端口与可用串口。"
-      : "灯带当前无法通信，灯效不会亮。下方是自动重连的详细记录与排查建议。");
+  put("lkBind", p.serial
+      ? (up ? "已绑定这一台（换 USB 口也认）"
+            : "序列号 " + p.serial + (p.port ? "（上次在 " + p.port + "）" : "")
+              + "，只看这一台")
+      : "");
+
+  if (up) {
+    // 正常时这些都是「上一次断线」的残留，全部不显示
+    ["lkSince", "lkAttempts", "lkDelay", "lkError", "lkPorts"].forEach(hideRow);
+  } else {
+    put("lkSince", l.since);
+    put("lkAttempts", l.attempts ? l.attempts + " 次" : "");
+    put("lkDelay", l.next_delay ? l.next_delay + " 秒后" : "");
+    put("lkError", l.error);
+    put("lkPorts", (l.ports || []).join("、"));
+  }
+
+  // 重试记录 + 排查建议：只在出问题时展示
+  const pre = document.getElementById("lkDetail");
+  if (up) {
+    pre.hidden = true;
+    pre.textContent = "";
+  } else {
+    pre.hidden = false;
+    pre.textContent = "最近重试记录：\n" + ((l.history || []).join("\n") || "（无）")
+                      + "\n\n" + (l.detail || "");
+  }
+
+  document.getElementById("linkSummary").textContent = up
+      ? "串口通信正常，灯效正在工作。"
+      : (l.state === "down"
+         ? "灯带当前无法通信，灯效不会亮；已停止自动重连。"
+         : "灯带当前无法通信，灯效不会亮。正在自动重连，插回 USB 后会自动恢复。");
 }
 function closeLinkDetail() {
   document.getElementById("linkMask").classList.remove("show");

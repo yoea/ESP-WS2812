@@ -2626,7 +2626,12 @@ class _Timestamped:
 
 
 def setup_background():
-    """后台模式：终端一个字都不输出，全部进日志文件，另外记下 pid 方便停"""
+    """后台模式：终端一个字都不输出，全部进日志文件，另外记下 pid 方便停。
+
+    注意：**这里不写 pid**。重复实例要先能被单实例检查拦下来，确认真的是本进程
+    在跑之后才写 —— 否则被拦下的那个已经把 pid 文件冲成自己的了，
+    `--autostart stop` 会去杀一个已经退出的 pid。见 main 里的 _record_pid()。
+    """
     os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
     try:
         if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > LOG_MAX_BYTES:
@@ -2636,12 +2641,17 @@ def setup_background():
     f = open(LOG_PATH, "a", encoding="utf-8")
     sys.stdout = _Timestamped(f)
     sys.stderr = sys.stdout
+    print(f"--- 后台启动 ---  {' '.join(sys.argv)}")
+
+
+def _record_pid():
+    """确认要长驻跑了才写 pid 文件（供 --autostart stop 使用）"""
     try:
+        os.makedirs(os.path.dirname(PID_PATH), exist_ok=True)
         with open(PID_PATH, "w", encoding="utf-8") as pf:
             pf.write(str(os.getpid()))
     except OSError:
         pass
-    print(f"--- 后台启动 ---  {' '.join(sys.argv)}")
 
 
 # ---------------- Windows 侧的小工具 ----------------
@@ -2893,6 +2903,35 @@ def _read_pid():
         return None
 
 
+def _pid_of_panel_owner(port=None):
+    """谁在监听面板端口 —— pid 文件过期时的兜底。
+
+    pid 文件只在「确实长驻起来」的那一刻写一次，进程被任务管理器强杀、
+    或者本机曾经起过两个实例时，里面记的可能是个早已退出的 pid。
+    这时按端口反查，才是真正在跑的那个。
+
+    port 默认值在函数体里取 PANEL_PORT：这个函数定义在常量之前的位置，
+    写成默认参数会在 import 阶段就抛 NameError。
+    """
+    port = PANEL_PORT if port is None else port
+    try:
+        p = subprocess.run(["netstat", "-ano", "-p", "TCP"], capture_output=True)
+        out = _decode(p.stdout)
+    except OSError:
+        return None
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0].upper() != "TCP":
+            continue
+        local, state = parts[1], parts[3].upper()
+        if state == "LISTENING" and local.endswith(f":{port}"):
+            try:
+                return int(parts[4])
+            except ValueError:
+                continue
+    return None
+
+
 def _pid_alive(pid):
     p = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True)
     return str(pid) in _decode(p.stdout)
@@ -2912,6 +2951,8 @@ def autostart_status():
     print(f"  启动文件夹方案：{'已装 ' + vbs if vbs and os.path.exists(vbs) else '未装'}")
 
     pid = _read_pid()
+    if not (pid and _pid_alive(pid)):
+        pid = _pid_of_panel_owner(PANEL_PORT)   # pid 文件过期就按端口反查
     if pid and _pid_alive(pid):
         print(f"  后台进程：正在运行（pid {pid}）")
     else:
@@ -2923,6 +2964,9 @@ def autostart_status():
 def autostart_stop():
     _schtasks(["/end", "/tn", TASK_NAME])     # 先结束任务实例，否则会被「失败重启」策略拉回来
     pid = _read_pid()
+    if not (pid and _pid_alive(pid)):
+        # pid 文件可能记的是被强杀过的旧进程：按面板端口反查真正在跑的那个
+        pid = _pid_of_panel_owner(PANEL_PORT)
     if pid and _pid_alive(pid):
         subprocess.run(["taskkill", "/pid", str(pid), "/f"], capture_output=True)
         print(f"  已停止后台进程（pid {pid}），灯已熄。")
@@ -2937,15 +2981,28 @@ def autostart_stop():
 
 
 def autostart_start():
+    # 已经在跑就别再起一个：两个实例会抢串口，先连上的那个会一直被踢下线
+    if _panel_is_ours(PANEL_PORT):
+        print("  已经在运行（面板端口有响应），不用重复启动。"
+              "要重启先 --autostart stop。")
+        return 0
     rc, out, err = _schtasks(["/run", "/tn", TASK_NAME])
     if rc == 0:
         print("  已让计划任务立刻启动一次（几秒后看 --autostart status 确认）。")
         return 0
     print("  计划任务没注册，直接后台启动一次：")
     pyw = _pythonw()
-    subprocess.Popen([pyw, os.path.abspath(__file__), "--background",
-                      "--wait-port", f"{DEFAULT_WAIT_PORT:g}"],
-                     cwd=BASE_DIR, close_fds=True)
+    argv = [pyw, os.path.abspath(__file__), "--background",
+            "--wait-port", f"{DEFAULT_WAIT_PORT:g}"]
+    # 被作业对象（job）管着的环境里，普通子进程会随调用方退出一起被回收 ——
+    # 先试「脱离作业对象」标志；不允许（WinError 5）就退回普通方式。
+    base_flags = 0x00000008 | 0x00000200 if os.name == "nt" else 0   # DETACHED|NEW_GROUP
+    try:
+        subprocess.Popen(argv, cwd=BASE_DIR, close_fds=True,
+                         creationflags=base_flags | 0x01000000)     # BREAKAWAY_FROM_JOB
+    except OSError:
+        subprocess.Popen(argv, cwd=BASE_DIR, close_fds=True,
+                         creationflags=base_flags)
     print("  已启动。要开机也自动跑，先跑 --autostart install。")
     return 0
 
@@ -3649,6 +3706,26 @@ def _panel_updated():
             f"{lt.tm_hour:02d}:{lt.tm_min:02d}")
 
 
+def _panel_is_ours(port=PANEL_PORT, timeout=1.5):
+    """本机该端口上是不是已经跑着一个 led_host_60.py。
+
+    能拿到 /api/status 且字段对得上就算「自己人」；连不上、超时、返回别的东西
+    一律 False（端口被别的程序占、或旧进程刚退出的空窗期），调用方继续重试即可。
+    本机请求绕过系统代理 —— 以前踩过 urllib 把 127.0.0.1 也交给代理导致误判。
+    """
+    import urllib.request
+    url = f"http://127.0.0.1:{port}/{PANEL_SECRET}/api/status"
+    try:
+        op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with op.open(url, timeout=timeout) as r:
+            if r.status != 200:
+                return False
+            data = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return False
+    return isinstance(data, dict) and "link" in data and "modes" in data
+
+
 def start_panel(controller, port=PANEL_PORT, log=print):
     """进程内 HTTP 面板，绑 0.0.0.0 供局域网访问。
 
@@ -3757,15 +3834,30 @@ def start_panel(controller, port=PANEL_PORT, log=print):
         return ThreadingHTTPServer(("0.0.0.0", port), Handler)
 
     def _retry_bind(first_error):
-        """端口被占用（旧进程残留 / 重启空窗）时不放弃：
-        只要本进程还活着，Web 就必须能打开，否则连串口错误都看不到。"""
+        """端口被占用时不放弃：只要本进程还活着，Web 就必须能打开，
+        否则连串口错误都看不到。
+
+        但要分清「端口被别的程序占」和「已经有一个 led_host_60.py 在跑」：
+        后者说明本进程是重复实例，不能死等 —— 两个实例会同时抢串口，
+        先连上的那个会被踢成「一直重连中」。连续 3 次探测到自己人就退出，
+        把串口和面板都留给已经在运行的那个。
+        """
         log(f"[面板] 端口 {port} 暂时绑定失败（{type(first_error).__name__}: "
             f"{first_error}）；后台每 3s 重试，直到端口释放")
+        others = 0
         while True:
             time.sleep(3.0)
             try:
                 h = _bind()
             except Exception:
+                if _panel_is_ours(port):
+                    others += 1
+                    if others >= 3:
+                        log(f"[面板] 端口 {port} 上已有一个 led_host_60.py 在应答 —— "
+                            "本进程是重复实例，退出，串口留给已在运行的那个")
+                        os._exit(0)
+                else:
+                    others = 0
                 continue
             controller.panel = {"port": port, "bound": True}
             log(f"[面板] 端口 {port} 绑定成功，Web 已可访问")
@@ -4222,6 +4314,15 @@ def main():
     # 而不是进程直接退出、只留一个打不开的页面。
     # 面板绑 0.0.0.0；首次运行若被 Windows 防火墙拦，需在防火墙里放行 Python/该端口。
     mode = ModeController(default=args.idle_mode)
+    # 单实例保护，必须早于碰串口：面板端口上已经有 led_host_60.py 在应答，
+    # 说明是重复启动。放它过去会两个进程抢同一个串口，先连上的那个被踢成
+    # 「一直重连中」——面板显示断开、灯却还在动，最难排查。
+    if not args.no_panel and _panel_is_ours(args.panel_port):
+        print(f"已有一个 led_host_60.py 在运行（面板端口 {args.panel_port} 有响应），"
+              "本次启动取消。要重启请先 --autostart stop。")
+        return 0
+    if args.background:
+        _record_pid()            # 确认没被拦下来，才占 pid 坑
     if not args.no_panel:
         panel = start_panel(mode, args.panel_port)
         if panel is not None:
