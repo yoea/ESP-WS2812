@@ -44,6 +44,22 @@ h1{font-size:23px;font-weight:600;letter-spacing:-.4px;margin:0;
    -webkit-background-clip:text;background-clip:text;color:transparent}
 .pill{display:inline-flex;align-items:center;gap:7px;padding:6px 12px;border-radius:999px;
       border:1px solid var(--line);background:var(--card);font-size:12px;color:var(--muted)}
+/* 全灭开关：顶部一个很小的 switch，代替原来的「全灭」卡片 */
+.kill{display:inline-flex;align-items:center;gap:7px;cursor:pointer;user-select:none;
+      font-size:11.5px;color:var(--dim);padding:2px 0}
+.kill input{position:absolute;opacity:0;width:0;height:0}
+.kill .track{position:relative;width:30px;height:17px;border-radius:999px;
+      background:rgba(255,255,255,.1);border:1px solid var(--line);transition:.18s}
+.kill .track::after{content:"";position:absolute;top:2px;left:2px;width:11px;height:11px;
+      border-radius:50%;background:#8992a3;transition:.18s}
+.kill input:checked+.track{background:rgba(255,72,72,.34);border-color:rgba(255,86,86,.62)}
+.kill input:checked+.track::after{left:15px;background:#ff8383}
+.kill input:checked~.klabel{color:#ff9d9d}
+.kill input:focus-visible+.track{outline:2px solid var(--accent);outline-offset:2px}
+/* GPU 卡片：把描述行换成实时占用率，等宽数字防跳动 */
+.gdesc{color:var(--muted)}
+.gdesc b{font-size:16px;font-weight:650;color:var(--accent);font-variant-numeric:tabular-nums;
+         margin:0 1px 0 4px;letter-spacing:.3px}
 .dot{width:7px;height:7px;border-radius:50%;background:var(--accent);box-shadow:0 0 10px var(--accent)}
 /* 串口链路状态胶囊：正常低调、断线醒目，点击看详情 */
 .linkpill{cursor:pointer;gap:6px}
@@ -151,6 +167,11 @@ input[type=range]{flex:1;accent-color:var(--accent);height:22px}
   <header>
     <div><h1>60 颗灯带</h1></div>
     <div style="flex:1"></div>
+    <label class="kill" title="全灭：整条强制不亮，覆盖任何灯效；关掉回到上一个模式">
+      <input type="checkbox" id="killSw">
+      <span class="track"></span>
+      <span class="klabel">全灭</span>
+    </label>
     <span class="pill"><span class="dot"></span><span id="curMode">自动</span></span>
     <span class="pill" id="curState">灯效：—</span>
     <button class="pill linkpill good" id="linkBadge" title="点击查看串口连接详情">
@@ -246,11 +267,37 @@ const CHASE = [[255, 40, 40], [60, 255, 80], [60, 120, 255], [255, 190, 40]];
 const SWATCHES = ["#FFFFFF", "#FFC896", "#FF5F14", "#FF3B30", "#FF2D7A", "#C77DFF", "#7B61FF", "#3B82F6",
                   "#38BDF8", "#00E5FF", "#2EE6A8", "#22C55E", "#A3E635", "#FACC15", "#FB923C", "#94A3B8"];
 
+/* ---------- GPU 监控：与 Python 端 gpu_frame() 同一套分段曲线 ---------- */
+let GPU = { load: 0, percent: 0, available: false, engines: 0 };
+// 颗数分段：0~10% → 11 颗、10~90% → 11~49 颗、90~100% → 49~60 颗
+const GPU_CNT_STOPS = [[0, 0], [.10, 11], [.90, 49], [1, 60]];
+// 色相：绿 120° → 黄 60° → 橙 30° → 红 0° → 紫红 -40°
+const GPU_HUE_STOPS = [[0, 120], [.10, 120], [.35, 60], [.60, 30], [.85, 0], [1, -40]];
+
+function piecewise(x, stops) {
+  x = clamp(x, 0, 1);
+  for (let j = 1; j < stops.length; j++) {
+    const x0 = stops[j - 1][0], y0 = stops[j - 1][1];
+    const x1 = stops[j][0], y1 = stops[j][1];
+    if (x <= x1) return x1 <= x0 ? y1 : y0 + (y1 - y0) * (x - x0) / (x1 - x0);
+  }
+  return stops[stops.length - 1][1];
+}
+
 /* 与 Python 端 idle_frame() 同一套公式，只少了 cap 归一化（预览用感知色显示）。
    TINT/GAIN 由 /api/status 下发，选完颜色立刻同步，预览跟着变。 */
 const PREVIEW = {
   auto:     () => OFF,
   off:      () => OFF,
+  gpu:      (t, i, n) => {
+    // 后端是 60 颗，预览只有 14 颗：按比例换算，最后一颗拿小数部分渐入
+    const load = clamp(GPU.load || 0, 0, 1);
+    if (load <= 0) return OFF;
+    const cnt = piecewise(load, GPU_CNT_STOPS) * n / 60;
+    if (i >= cnt) return OFF;
+    const hue = ((piecewise(load, GPU_HUE_STOPS) % 360) + 360) % 360;
+    return tone(hsv(hue, 1, 1), Math.min(1, cnt - i) * GAIN.gpu);
+  },
   rainbow:  (t, i, n) => tone(hsv((t * 40 + i / (n - 1) * 300) % 360, .9, 1), GAIN.rainbow),
   breathe:  (t) => tone(TINT.breathe, GAIN.breathe * (.03 + .97 * (.5 - .5 * Math.cos(2 * Math.PI * t / 4)))),
   solid:    () => tone(TINT.solid, GAIN.solid),
@@ -363,14 +410,17 @@ function paintColorDot(key) {
 function build(list) {
   grid.innerHTML = "";
   cards.clear(); visible.clear();
-  list.forEach(m => {
+  // 「全灭」不再是一张卡片，改到顶栏那个小 switch 了
+  list.filter(m => m.key !== "off").forEach(m => {
     // 10 种装饰模式都有设置点：6 种可调颜色+强度，其余 4 种只调强度。
     const adjustable = DECOR_MODES.includes(m.key);
     const el = document.createElement("div");
     el.className = "card" + (m.key === current ? " on" : "");
     el.dataset.mode = m.key;
     el.innerHTML = `<div class="chead"><span class="name">${m.label}</span><span class="key">${m.key}</span></div>
-                    <div class="desc">${m.desc}</div>${svgFor(m.key)}
+                    ${m.key === "gpu"
+                      ? '<div class="desc gdesc">GPU 占用<b class="gpuval">—</b>%</div>'
+                      : `<div class="desc">${m.desc}</div>`}${svgFor(m.key)}
                     ${adjustable ? '<button class="cdot" aria-label="设置颜色与强度"></button>' : ''}`;
     el.addEventListener("click", () => setMode(m.key));
     if (adjustable) {
@@ -384,6 +434,7 @@ function build(list) {
     if (adjustable) paintColorDot(m.key);
   });
   paintSelection();
+  paintGpu();          // 卡片刚建出来，先把当前占用率填上，别停在 —
 }
 
 const io = new IntersectionObserver(entries => {
@@ -396,7 +447,18 @@ const io = new IntersectionObserver(entries => {
 function paintSelection() {
   cards.forEach((o, k) => o.el.classList.toggle("on", k === current));
   const m = modes.find(x => x.key === current);
-  document.getElementById("curMode").textContent = m ? m.label : current;
+  // off 没有卡片了，直接显示「全灭」而不是内部 key
+  document.getElementById("curMode").textContent =
+    m ? m.label : (current === "off" ? "全灭" : current);
+  const sw = document.getElementById("killSw");
+  if (sw) sw.checked = (current === "off");
+}
+
+function paintGpu() {
+  const card = cards.get("gpu");
+  if (!card) return;
+  const el = card.el.querySelector(".gpuval");
+  if (el) el.textContent = GPU.available ? Number(GPU.percent).toFixed(1) : "—";
 }
 
 function liveColor(c) {
@@ -458,6 +520,7 @@ async function refresh() {
     DEFAULT_LEVEL = (j.defaultLevel == null ? 0.5 : j.defaultLevel);
     applyColors(); applyLevels();
     updateLink(j.link);
+    if (j.gpu) { GPU = j.gpu; paintGpu(); }
     if (j.version) {
       document.getElementById("verBox").textContent =
         (j.version.commit || "dev") + " · " + (j.version.updated || "—");
@@ -479,6 +542,7 @@ async function pollFrame() {
     const j = await r.json();
     live = j.live;
     updateLink(j.link);
+    if (j.gpu) { GPU = j.gpu; paintGpu(); }
     if (j.mode !== current) { current = j.mode; paintSelection(); }
     const names = { media: "放歌", mic: "麦克风", ambient: "环境彩虹", idle: "空闲" };
     document.getElementById("curState").textContent = "灯效：" + (names[j.state] || j.state);
@@ -738,6 +802,18 @@ document.getElementById("resetBtn").addEventListener("click", async () => {
     if (colorable) setPickerColor(defaultColors[pickerMode]);  // 接口已恢复，不必再推
     toast("已恢复默认");
   } catch (e) { toast("恢复失败：" + e.message); }
+});
+
+/* ---------- 顶栏全灭开关：打开 = off，关掉 = 回上一个模式 ---------- */
+let prevMode = "auto";
+document.getElementById("killSw").addEventListener("change", async e => {
+  if (e.target.checked) {
+    if (current !== "off") prevMode = current;
+    await setMode("off");
+  } else {
+    const back = (prevMode && prevMode !== "off") ? prevMode : "auto";
+    await setMode(back);
+  }
 });
 
 refresh();

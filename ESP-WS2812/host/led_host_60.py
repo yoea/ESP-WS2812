@@ -154,6 +154,7 @@ BRIGHTNESS_CAP=128 / setBrightness 50%），host 不再二次打折，否则两�
 import argparse
 import asyncio
 import colorsys
+import ctypes
 import hashlib
 import io
 import json
@@ -2455,6 +2456,9 @@ class Monitor:
             self._mode_polled = now
         mode = self.mode.current
         decor_on = False
+        # GPU 读数：1Hz 采样 -> 每帧插值，快起慢落。不管当前是不是 gpu 模式
+        # 都更新，面板卡片上的百分比才不会只在选中时才动。
+        self.mode.gpu_tick()
 
         # off：整条永远不亮，覆盖一切状态
         if mode == "off":
@@ -2470,7 +2474,8 @@ class Monitor:
             # 基色只对支持自定义颜色的 6 种生效（idle_frame 里会按模式过滤）。
             # 颜色只定色相，亮度仍由模式自己的 lv 决定，两者在 _idle_tone 解耦。
             base, level = self.mode.color_of(mode)
-            target = idle_frame(mode, now, base=base, level=level)
+            target = idle_frame(mode, now, base=base, level=level,
+                                gpu=self.mode.gpu_load)
             self._raw_frame = True
             decor_on = True
         # auto：完全保持原有灯效逻辑（放歌封面 / 麦克风 VU / 环境彩虹）。
@@ -3234,7 +3239,8 @@ FIRMWARE_BRIGHTNESS_CAP = 128     # 仅供面板显示，真正的限流在固�
 
 IDLE_MODES = (
     ("auto",     "自动",     "放歌封面 / 麦克风电平 / 彩虹电平，空闲全灭"),
-    ("off",      "全灭",     "整条强制不亮，覆盖一切"),
+    ("off",      "全灭",     "整条强制不亮，覆盖一切（面板顶部开关）"),
+    ("gpu",      "GPU 监控", "占用 0-100% 对应 0-60 颗，绿→黄→橙→红→紫红"),
     ("rainbow",  "彩虹流动", "300° 渐变沿灯带缓慢流动"),
     ("breathe",  "呼吸灯",   "整条同色渐亮渐暗，可自定义颜色"),
     ("solid",    "纯色常亮", "固定色当氛围照明，可自定义颜色"),
@@ -3256,6 +3262,235 @@ COMET_TAIL_LEDS = 10
 COMET_STEP_SEC = 0.075         # 每颗停 75ms，60 颗一圈 4.5s
 
 IDLE_COLOR_MODES = ("solid", "breathe", "wave", "comet", "fire", "twinkle")
+
+
+# ============================================================
+# GPU 监控（装饰模式之一）：Windows PDH 的 GPU Engine 利用率
+# ============================================================
+# 数据源 \GPU Engine(*)\Utilization Percentage。零第三方依赖：ctypes 直调
+# pdh.dll，进程内持久 query，1Hz 采样，不 spawn 子进程、不读注册表。
+#
+# ★ 聚合口径：每个实例是「某进程在某块 GPU 的某个引擎上的利用率」，
+#   同一块 GPU 的**同类引擎必须求和**，再对所有 (GPU, 引擎类型) 取最忙的
+#   那一组 —— 这才是任务管理器「GPU 利用率」的口径。旧实现取「所有实例
+#   最大值」，多进程同时渲染时会严重低估（三个进程各 30% 只报 30%）。
+GPU_POLL_HZ = 1.0                # PDH 采样频率（1Hz 足够，开销可忽略）
+GPU_ATTACK_TAU = 0.15            # 渲染端平滑：快起
+GPU_RELEASE_TAU = 0.60           # 慢落，避免读数掉一格时灯珠整片缩回
+
+# 颗数分段（用户指定）：0~10% 用 0→11 颗、10~90% 用 11→49 颗、
+# 90~100% 用 49→60 颗。两端各 11 颗是精细档位，中间 38 颗铺 80% 的区间。
+GPU_COUNT_STOPS = ((0.00, 0.0), (0.10, 11.0), (0.90, 49.0), (1.00, 60.0))
+# 色相：绿 120° → 黄 60° → 橙 30° → 红 0° → 紫红 -40°(即 320°)。
+# 0~10% 锁在绿色，低占用不会一上来就变黄；35% 转黄、60% 转橙、85% 转红。
+GPU_HUE_STOPS = ((0.00, 120.0), (0.10, 120.0), (0.35, 60.0),
+                 (0.60, 30.0), (0.85, 0.0), (1.00, -40.0))
+
+PDH_FMT_DOUBLE = 0x00000200
+PDH_MORE_DATA = 0x800007D2       # buffer 传 NULL 时的正常返回，不是错误
+PDH_CSTATUS_VALID = (0, 1)       # VALID_DATA / NEW_DATA
+
+
+class _PdhValue(ctypes.Union):
+    _fields_ = [("longValue", ctypes.c_long),
+                ("doubleValue", ctypes.c_double),
+                ("largeValue", ctypes.c_longlong),
+                ("AnsiStringValue", ctypes.c_char_p),
+                ("WideStringValue", ctypes.c_wchar_p)]
+
+
+class _PdhFmtValue(ctypes.Structure):
+    _fields_ = [("CStatus", ctypes.c_uint32), ("value", _PdhValue)]
+
+
+class _PdhFmtItemW(ctypes.Structure):
+    _fields_ = [("szName", ctypes.c_wchar_p), ("FmtValue", _PdhFmtValue)]
+
+
+def _load_pdh():
+    pdh = ctypes.WinDLL("pdh.dll")
+    pdh.PdhOpenQueryW.argtypes = [ctypes.c_wchar_p, ctypes.c_size_t,
+                                  ctypes.POINTER(ctypes.c_void_p)]
+    pdh.PdhOpenQueryW.restype = ctypes.c_uint32
+    pdh.PdhAddCounterW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+                                   ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p)]
+    pdh.PdhAddCounterW.restype = ctypes.c_uint32
+    pdh.PdhCollectQueryData.argtypes = [ctypes.c_void_p]
+    pdh.PdhCollectQueryData.restype = ctypes.c_uint32
+    pdh.PdhGetFormattedCounterArrayW.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32),
+        ctypes.POINTER(_PdhFmtItemW)]
+    pdh.PdhGetFormattedCounterArrayW.restype = ctypes.c_uint32
+    pdh.PdhCloseQuery.argtypes = [ctypes.c_void_p]
+    pdh.PdhCloseQuery.restype = ctypes.c_uint32
+    return pdh
+
+
+class GpuMeter:
+    """PDH 采集线程：1Hz 读 GPU Engine 利用率，归一化成 0~1。
+
+    只暴露 value（0~1）与 available 两个属性，渲染线程直接读
+    （CPython 属性赋值原子，不用锁）。任何环节失败都保持 0.0 —— 灯全灭降级，
+    绝不猜值，也绝不影响主灯效。
+    """
+    PATH = r"\GPU Engine(*)\Utilization Percentage"
+    # pid_13912_luid_0x00000000_0x00011242_phys_0_eng_0_engtype_3D
+    INST_RE = re.compile(r"luid_(0x[0-9a-fA-F]+)_(0x[0-9a-fA-F]+)"
+                         r"_phys_(\d+).*?_engtype_(\w+)")
+
+    def __init__(self, poll_hz=GPU_POLL_HZ, log=print):
+        self.value = 0.0
+        self.raw = 0.0
+        self.engines = 0
+        self.available = False
+        self._log = log
+        self._interval = 1.0 / max(0.2, poll_hz)
+        self._stop = threading.Event()
+        self._pdh = None
+        self._query = None
+        self._counter = None
+
+    def start(self):
+        threading.Thread(target=self._loop, name="gpu-meter", daemon=True).start()
+        return self
+
+    def stop(self):
+        self._stop.set()
+
+    def _open(self):
+        try:
+            pdh = _load_pdh()
+            q = ctypes.c_void_p()
+            rc = pdh.PdhOpenQueryW(None, 0, ctypes.byref(q))
+            if rc != 0:
+                self._log(f"[GPU] PdhOpenQuery 失败 0x{rc:08X}；GPU 卡片显示 —")
+                return False
+            c = ctypes.c_void_p()
+            rc = pdh.PdhAddCounterW(q, self.PATH, 0, ctypes.byref(c))
+            if rc != 0:
+                self._log(f"[GPU] PdhAddCounter 失败 0x{rc:08X}；GPU 卡片显示 —")
+                pdh.PdhCloseQuery(q)
+                return False
+            self._pdh, self._query, self._counter = pdh, q, c
+            pdh.PdhCollectQueryData(q)       # 速率型计数器先预热一次
+            return True
+        except Exception as e:
+            self._log(f"[GPU] PDH 初始化异常（{type(e).__name__}: {e}）；GPU 卡片显示 —")
+            return False
+
+    def _sample(self):
+        pdh = self._pdh
+        size = ctypes.c_uint32(0)
+        count = ctypes.c_uint32(0)
+        rc = pdh.PdhGetFormattedCounterArrayW(
+            self._counter, PDH_FMT_DOUBLE, ctypes.byref(size),
+            ctypes.byref(count), None)
+        if rc not in (0, PDH_MORE_DATA) or size.value == 0:
+            return None
+        item_sz = ctypes.sizeof(_PdhFmtItemW)
+        max_items = size.value // item_sz
+        if max_items < 1 or max_items > 8192:
+            return None
+        # PDH 报的 size 是「item 数组 + 全部实例名字符串」的总字节数
+        # （实测 279 个实例要 43050 字节，远大于 279×24）。必须按原 size
+        # 精确分配字节缓冲；按 item 数另算会少分配、PDH 直接报错。
+        buf = ctypes.create_string_buffer(size.value)
+        rc = pdh.PdhGetFormattedCounterArrayW(
+            self._counter, PDH_FMT_DOUBLE, ctypes.byref(size),
+            ctypes.byref(count), ctypes.cast(buf, ctypes.POINTER(_PdhFmtItemW)))
+        if rc != 0:
+            return None
+        arr = ctypes.cast(buf, ctypes.POINTER(_PdhFmtItemW))
+        groups = {}
+        for i in range(min(count.value, max_items)):
+            it = arr[i]
+            if it.FmtValue.CStatus not in PDH_CSTATUS_VALID:
+                continue
+            v = it.FmtValue.value.doubleValue
+            if not (math.isfinite(v) and 0.0 <= v <= 100.0):
+                continue
+            m = self.INST_RE.search(it.szName or "")
+            key = m.groups() if m else ("?", "?", "?", "?")
+            groups[key] = groups.get(key, 0.0) + v
+        if not groups:
+            return None
+        self.engines = len(groups)
+        return min(100.0, max(groups.values()))
+
+    def _loop(self):
+        if not self._open():
+            return
+        self.available = True
+        misses = 0
+        try:
+            while not self._stop.wait(self._interval):
+                if self._pdh.PdhCollectQueryData(self._query) != 0:
+                    misses += 1
+                else:
+                    v = self._sample()
+                    if v is None:
+                        misses += 1
+                    else:
+                        misses = 0
+                        self.raw = v
+                        self.value = v / 100.0
+                # 连续 5 次拿不到数据（计数器消失 / 驱动异常）→ 归零降级，
+                # 不能让灯冻在最后一帧，让人误以为 GPU 一直满载。
+                if misses >= 5:
+                    self.value = 0.0
+        except Exception as e:
+            self._log(f"[GPU] 采集线程异常（{type(e).__name__}: {e}），读数归零")
+            self.value = 0.0
+        finally:
+            self.available = False
+            try:
+                if self._query:
+                    self._pdh.PdhCloseQuery(self._query)
+            except Exception:
+                pass
+
+
+def _gpu_piecewise(x, stops):
+    x = max(0.0, min(1.0, x))
+    for (x0, y0), (x1, y1) in zip(stops, stops[1:]):
+        if x <= x1:
+            if x1 <= x0:
+                return y1
+            return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+    return stops[-1][1]
+
+
+def gpu_led_count(load):
+    """占用 0~1 -> 亮几颗（含小数，小数部分是最后一颗的亮度系数）。"""
+    return _gpu_piecewise(load, GPU_COUNT_STOPS)
+
+
+def gpu_hue(load):
+    """占用 0~1 -> 色相角度（可能为负，hsv_to_rgb 内部取模）。"""
+    return _gpu_piecewise(load, GPU_HUE_STOPS) % 360.0
+
+
+def gpu_frame(load, n=LED_COUNT, level=1.0):
+    """占用 0~1 -> n 颗 RGB（调用方 raw 直出）。
+
+    已亮的灯珠**同一个色相**：颜色 = 精确读数，颗数 = 分段档位，
+    下一颗拿小数部分当亮度系数渐入，视觉上是连续推进而不是跳一格。
+    """
+    lv = _clamp01(level)
+    if load <= 0.0 or lv <= 0.0:
+        return [(0, 0, 0)] * n
+    col = tuple(int(round(c * lv)) for c in hsv_to_rgb(gpu_hue(load), 1.0, 1.0))
+    want = gpu_led_count(load) * (n / float(LED_COUNT))   # 预览颗数不同也能用
+    whole = int(want)
+    frac = want - whole
+    if whole >= n:
+        return [col] * n
+    out = [(0, 0, 0)] * n
+    for i in range(whole + (1 if frac > 1e-6 else 0)):
+        k = frac if i == whole else 1.0
+        out[i] = tuple(int(round(c * k)) for c in col)
+    return out
 # 所有装饰模式的默认整体强度：会整条全亮的模式（纯色/渐变/跑马灯/彩虹/呼吸）
 # 默认只发 50%，避免 host 上限放开后一上来就吃满 1.8A。用户可在面板拖到
 # 10%~100%，按模式独立保存。auto / off 不走装饰帧，不需要强度。
@@ -3311,18 +3546,23 @@ def _hash01(i, t):
     return v - math.floor(v)
 
 
-def idle_frame(mode, now, n=LED_COUNT, base=None, level=1.0):
+def idle_frame(mode, now, n=LED_COUNT, base=None, level=1.0, gpu=0.0):
     """空闲装饰帧：返回 n 颗 0~255 颜色值（调用方 raw 直出）。
 
     纯函数，按 now 算相位；50Hz × 60 颗的 sin/cos 开销 <1ms，不占帧预算。
     base 就是实际颜色（不放大、不改色相），lv 决定明暗，两者在
     _idle_tone 里线性相乘；level 是用户在面板上选的整体强度
     （0.1~1.0，只缩不放）。
+    gpu 是 GPU 模式的输入：已平滑的占用率 0~1（由 GpuMeter 采集、
+    ModeController.tick 插值），只有 gpu 模式用它。
     亮度上限由固件 BRIGHTNESS_CAP=128 统一负责，这里不再二次打折。
     auto / off / 未知模式一律全灭。
     """
     if mode not in DECOR_MODES:
         return [(0, 0, 0)] * n
+    # GPU 监控整条一起算（颗数 + 颜色都由 load 决定），不走下面逐颗的循环
+    if mode == "gpu":
+        return gpu_frame(gpu, n, level)
     t = float(now)
     gain = _clamp01(level)
     custom = base if (mode in IDLE_COLOR_MODES and base) else None
@@ -3449,11 +3689,62 @@ class ModeController:
                      "ports": [], "device": {}, "profile": {},
                      "bound": False, "detail": LINK_HINT}
         self.panel = {"port": PANEL_PORT, "bound": False}
+        # GPU 监控：meter 由 main 注入（--no-gpu 时保持 None）。
+        # gpu 整个 dict 替换，HTTP 线程读到的永远是一致快照。
+        self.gpu_meter = None
+        self.gpu = {"load": 0.0, "percent": 0.0,
+                    "available": False, "engines": 0}
+        self._gpu_shown = 0.0        # 渲染端平滑后的占用率（只主循环写）
         self._mtime = None
         # 只有真正在跑面板状态文件时才迁移；离线探针传临时路径不碰旧文件
         if os.path.abspath(path) == os.path.abspath(PANEL_STATE_FILE):
             self._migrate()
         self._load()
+
+    def gpu_tick(self):
+        """把 GpuMeter 的 1Hz 读数插值成 50Hz 平滑值，并发布给面板。
+
+        PDH 一秒才动一次，直接拿去点亮会让 60 颗在 1Hz 上「啪」地跳一格。
+        快起（0.15s）保证读数一涨灯就上来，慢落（0.60s）避免掉一格时
+        整片缩回。raw 归零且已经很低时直接钉 0，别留个 0.4% 的残影。
+
+        由 Monitor.tick 每帧调用；放在这里是因为 gpu 快照要跟着模式状态一起
+        给 HTTP 线程读，而 gpu 模式渲染时也要用同一个平滑值（gpu_load）。
+        """
+        meter = self.gpu_meter
+        if meter is None:
+            return
+        raw = max(0.0, min(1.0, float(meter.value)))
+        tau = GPU_ATTACK_TAU if raw > self._gpu_shown else GPU_RELEASE_TAU
+        self._gpu_shown += (raw - self._gpu_shown) * (1.0 - math.exp(-FRAME_INTERVAL / tau))
+        if raw <= 0.0 and self._gpu_shown < 0.002:
+            self._gpu_shown = 0.0
+        self.gpu = {"load": round(self._gpu_shown, 4),
+                    "percent": round(self._gpu_shown * 100.0, 1),
+                    "available": bool(meter.available),
+                    "engines": int(getattr(meter, "engines", 0) or 0)}
+
+    @property
+    def gpu_load(self):
+        """渲染用的平滑占用率（0~1），只有 gpu 模式会读。"""
+        return self._gpu_shown
+
+    def gpu_status(self):
+        """给面板的快照。
+
+        正常情况返回 gpu_tick 平滑后的值；但渲染循环只在串口连通时才跑
+        （串口断开 / 重连期间 tick 会卡在 connect 里），这时候不能因为
+        「没渲染」就让卡片一直显示 —，直接退化到采集器的原始读数。
+        """
+        meter = self.gpu_meter
+        if meter is None:
+            return self.gpu
+        if not self.gpu.get("engines") and meter.available:
+            v = max(0.0, min(1.0, float(meter.value)))
+            return {"load": round(v, 4), "percent": round(v * 100.0, 1),
+                    "available": True,
+                    "engines": int(getattr(meter, "engines", 0) or 0)}
+        return self.gpu
 
     @staticmethod
     def _parse_colors(raw):
@@ -3779,6 +4070,7 @@ def start_panel(controller, port=PANEL_PORT, log=print):
                     "colors": controller.colors,
                     "levels": controller.levels,
                     "defaultLevel": IDLE_DEFAULT_LEVEL,
+                    "gpu": controller.gpu_status(),
                     "link": controller.link,
                     "panel": controller.panel,
                     "version": {"commit": panel_commit,
@@ -3791,6 +4083,7 @@ def start_panel(controller, port=PANEL_PORT, log=print):
                     "mode": controller.current,
                     "state": controller.state,
                     "live": controller.live,
+                    "gpu": controller.gpu_status(),   # GPU 卡片 150ms 刷新占用率
                     "link": controller.link,     # 150ms 轮询，断线状态能及时反映
                 }, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
                 return self._send(200, data, "application/json; charset=utf-8")
@@ -4226,6 +4519,9 @@ def main():
     ap.add_argument("--no-status-led", action="store_true",
                     help="不用板载 LED(GPIO2/D4)做常亮状态指示和事件提示"
                          "（GPIO2 另有用途时才需要）")
+    ap.add_argument("--no-gpu", action="store_true",
+                    help="不读 GPU 占用（默认走 PDH 采集，1Hz，开销可忽略）；"
+                         "关掉后 GPU 面板卡片显示 —，选中该模式灯全灭")
     ap.add_argument("--app-filter", default=None,
                     help="只认某个播放器的媒体会话，例如 cloudmusic.exe")
     ap.add_argument("--cover-layout", default="spatial", choices=["spatial", "weight"],
@@ -4322,6 +4618,14 @@ def main():
         print(f"已有一个 led_host_60.py 在运行（面板端口 {args.panel_port} 有响应），"
               "本次启动取消。要重启请先 --autostart stop。")
         return 0
+    # GPU 采集：1Hz 读 PDH，面板卡片和 gpu 模式共用这一份读数。
+    # PDH 不可用（老系统 / 权限被限）时 meter 自己降级成 0 并标 available=False，
+    # 不影响灯效、串口和面板 —— 只是卡片显示 —。
+    # 放在单实例检查之后，重复实例不会多开一个 PDH query。
+    gpu_meter = None
+    if not args.no_gpu:
+        gpu_meter = GpuMeter(log=print).start()
+        mode.gpu_meter = gpu_meter
     if args.background:
         _record_pid()            # 确认没被拦下来，才占 pid 坑
     if not args.no_panel:
