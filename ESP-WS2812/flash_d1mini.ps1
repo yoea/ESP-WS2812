@@ -261,9 +261,10 @@ finally {
         if ($NoRestore) {
             Write-Notice '已指定 -NoRestore，不自动恢复。手动起：python led_host_60.py --autostart start'
         } else {
-            # 优先用计划任务拉起：Start-Process 起的 pythonw 会随命令行会话结束被回收
-            # （终端一关就死），任务计划拉起的进程才是真正脱离出去的。
+            # 顺序：计划任务 > 启动文件夹的 VBS 启动器 > 直接 Start-Process。
+            # 只有前两种能真正脱离终端会话；Start-Process 起的 pythonw 会随终端关闭被回收。
             $TaskName = 'ESP-WS2812 60颗音乐灯带'
+            $VbsPath  = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\ESP-WS2812 60颗音乐灯带.vbs'
             $restored = $false
             try {
                 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
@@ -274,6 +275,16 @@ finally {
                 }
             } catch {
                 Write-Notice "计划任务拉起失败：$($_.Exception.Message)"
+            }
+            if (-not $restored -and (Test-Path -LiteralPath $VbsPath)) {
+                try {
+                    & wscript.exe $VbsPath
+                    Start-Sleep -Seconds 3
+                    $restored = $true
+                    Write-Ok "已通过启动器 VBS 恢复灯效服务（未注册计划任务，崩溃不会自动重启）"
+                } catch {
+                    Write-Notice "VBS 启动器执行失败：$($_.Exception.Message)"
+                }
             }
             if (-not $restored) {
                 foreach ($s in $stopped) {
