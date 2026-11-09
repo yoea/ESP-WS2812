@@ -1,0 +1,710 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- iOS Safari：状态栏/顶栏用网页顶部同色，消除黑色与页面之间的硬分界。
+     添加到主屏幕后下面三条让网页真正延伸到状态栏后面（black-translucent），
+     状态栏文字浮在网页上；内容靠 env(safe-area-inset-top) 让开。 -->
+<meta name="theme-color" content="#171b31">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="灯带">
+<title>60 颗灯带 · 控制面板</title>
+<style>
+:root{
+  --bg:#0b0d12; --card:rgba(255,255,255,.038); --card-hi:rgba(255,255,255,.065);
+  --line:rgba(255,255,255,.09); --line-hi:rgba(98,213,255,.55);
+  --txt:#eef2f8; --muted:#98a2b3; --dim:#6b7484;
+  --accent:#62d5ff; --accent-soft:rgba(98,213,255,.13);
+  --r:18px;
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+/* 整页实色兜底：iOS standalone（black-translucent）下网页从 y=0 起绘制，
+   根节点底色与 theme-color 一致，状态栏区域不会出现一条纯黑。 */
+html{background:#171b31}
+body{
+  min-height:100vh;
+  background:radial-gradient(1200px 620px at 12% -8%,#16243a 0%,transparent 58%),
+             radial-gradient(900px 520px at 96% 4%,#251a38 0%,transparent 55%),
+             var(--bg);
+  color:var(--txt);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  -webkit-font-smoothing:antialiased;
+  -webkit-tap-highlight-color:transparent;
+  padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+.wrap{max-width:1180px;margin:0 auto;padding:28px 20px 48px}
+header{display:flex;flex-wrap:wrap;align-items:flex-end;gap:14px;margin-bottom:8px}
+h1{font-size:23px;font-weight:600;letter-spacing:-.4px;margin:0;
+   background:linear-gradient(100deg,#ffffff 10%,var(--accent) 92%);
+   -webkit-background-clip:text;background-clip:text;color:transparent}
+.pill{display:inline-flex;align-items:center;gap:7px;padding:6px 12px;border-radius:999px;
+      border:1px solid var(--line);background:var(--card);font-size:12px;color:var(--muted)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--accent);box-shadow:0 0 10px var(--accent)}
+/* 串口链路状态胶囊：正常低调、断线醒目，点击看详情 */
+.linkpill{cursor:pointer;gap:6px}
+.linkpill .licon{font-size:13px;line-height:1}
+.linkpill.good{color:var(--muted)}
+.linkpill.warn{border-color:rgba(255,190,60,.55);background:rgba(255,180,50,.12);color:#ffd891}
+.linkpill.bad{border-color:rgba(255,90,90,.6);background:rgba(255,60,60,.14);color:#ffb4b4;
+              animation:linkpulse 1.6s ease-in-out infinite}
+@keyframes linkpulse{0%,100%{box-shadow:0 0 0 0 rgba(255,80,80,0)}50%{box-shadow:0 0 0 5px rgba(255,80,80,.13)}}
+.lrow{display:flex;gap:10px;padding:8px 0;border-bottom:1px solid var(--line);font-size:12.5px}
+.lrow .k{color:var(--dim);min-width:80px;flex:none}
+.lrow .v{color:var(--txt);word-break:break-all;flex:1}
+pre.lpre{margin:12px 0 0;padding:11px 13px;background:rgba(0,0,0,.32);
+  border:1px solid var(--line);border-radius:10px;
+  font:11.5px/1.7 ui-monospace,Menlo,Consolas,monospace;
+  color:var(--muted);white-space:pre-wrap;word-break:break-all;
+  max-height:230px;overflow:auto}
+button{font:inherit;cursor:pointer;border:1px solid var(--line);background:var(--card-hi);
+       color:var(--txt);border-radius:10px;padding:8px 14px;font-size:12.5px;transition:.18s}
+button:hover{border-color:var(--line-hi);background:var(--accent-soft)}
+button:active{transform:scale(.97)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:14px;margin-top:22px}
+.card{position:relative;border:1px solid var(--line);border-radius:var(--r);
+      background:var(--card);padding:16px 16px 14px;cursor:pointer;overflow:hidden;
+      transition:transform .2s,border-color .2s,background .2s,box-shadow .2s;
+      -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px)}
+.card:hover{transform:translateY(-3px);background:var(--card-hi);border-color:rgba(255,255,255,.2)}
+.card.on{border-color:var(--line-hi);background:linear-gradient(160deg,var(--accent-soft),var(--card) 62%);
+         box-shadow:0 0 0 1px rgba(98,213,255,.18),0 14px 40px rgba(0,0,0,.32)}
+.card.on::after{content:"当前";position:absolute;top:14px;right:46px;font-size:11px;
+      color:#04141d;background:var(--accent);padding:3px 9px;border-radius:999px;font-weight:600}
+.chead{display:flex;align-items:baseline;gap:9px;padding-right:52px}
+.name{font-size:15px;font-weight:600;letter-spacing:.2px}
+.key{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;color:var(--dim)}
+.desc{font-size:12px;color:var(--muted);margin:5px 0 13px;line-height:1.55;min-height:19px}
+.strip{width:100%;height:auto;display:block;border-radius:10px}
+/* 卡片右上角的颜色点：只有可自定义颜色的模式才有 */
+.cdot{position:absolute;top:12px;right:12px;width:26px;height:26px;padding:0;
+      border-radius:50%;border:2px solid rgba(255,255,255,.65);
+      background:var(--c,#8a93a3);
+      box-shadow:0 0 0 3px rgba(0,0,0,.28),0 2px 9px rgba(0,0,0,.45);z-index:2}
+.cdot:hover{background:var(--c,#8a93a3);border-color:#fff;transform:scale(1.12)}
+.foot{margin-top:28px;padding-top:14px;border-top:1px solid var(--line);
+      display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;
+      justify-content:flex-start;font-size:11.5px;color:var(--dim)}
+.ver{font-family:ui-monospace,Menlo,Consolas,monospace;color:var(--muted)}
+.toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,20px);opacity:0;
+       background:#16202c;border:1px solid var(--line-hi);color:var(--txt);
+       padding:10px 18px;border-radius:12px;font-size:13px;pointer-events:none;
+       transition:.25s;z-index:30;max-width:90vw;text-align:center}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+/* 颜色选择模态框 */
+.mask{position:fixed;inset:0;z-index:20;display:none;align-items:center;justify-content:center;
+      padding:16px;background:rgba(4,7,12,.74);
+      -webkit-backdrop-filter:blur(9px);backdrop-filter:blur(9px)}
+.mask.show{display:flex}
+.sheet{width:min(420px,100%);max-height:calc(100vh - 32px);overflow:auto;
+       padding:20px;border-radius:20px;border:1px solid rgba(255,255,255,.15);
+       background:linear-gradient(160deg,#182231,#10151e 72%);
+       box-shadow:0 24px 70px rgba(0,0,0,.65)}
+.sheet h2{font-size:17px;font-weight:600;margin:0 0 4px}
+.hint{font-size:12px;color:var(--muted);line-height:1.65;margin:0 0 16px}
+.wheel{width:min(190px,58vw);aspect-ratio:1;height:auto;margin:0 auto 18px;position:relative;
+       border-radius:50%;cursor:crosshair;touch-action:none;
+       background:radial-gradient(circle at 50% 50%,#fff 0%,rgba(255,255,255,0) 72%),
+                  conic-gradient(#f00,#ff0,#0f0,#0ff,#00f,#f0f,#f00);
+       box-shadow:inset 0 0 0 1px rgba(255,255,255,.28),0 8px 26px rgba(0,0,0,.45)}
+.wheel-dot{position:absolute;width:16px;height:16px;border-radius:50%;border:2px solid #fff;
+           transform:translate(-50%,-50%);pointer-events:none;
+           box-shadow:0 0 0 1px rgba(0,0,0,.65),0 2px 7px rgba(0,0,0,.5)}
+.row{display:flex;align-items:center;gap:10px;margin:12px 0}
+.row label{font-size:12px;color:var(--muted);min-width:54px}
+.row .val{font-size:12px;color:var(--accent);min-width:38px;text-align:right;
+          font-family:ui-monospace,Menlo,Consolas,monospace}
+input[type=range]{flex:1;accent-color:var(--accent);height:22px}
+.swatches{display:grid;grid-template-columns:repeat(8,1fr);gap:8px;margin:16px 0 6px}
+.sw{aspect-ratio:1;padding:0;border-radius:9px;border:1px solid rgba(255,255,255,.2);
+    background:var(--c,#888)}
+.sw:hover{background:var(--c,#888);border-color:#fff;transform:scale(1.1)}
+.sw.on{box-shadow:0 0 0 2px var(--accent),0 0 12px rgba(98,213,255,.5)}
+.hexrow{display:flex;gap:9px;align-items:center;margin:12px 0 4px}
+.hexrow input{flex:1;min-width:0;background:rgba(0,0,0,.32);border:1px solid var(--line);
+   color:var(--txt);border-radius:9px;padding:9px 11px;
+   font:13px ui-monospace,Menlo,Consolas,monospace;letter-spacing:.5px}
+.prev{width:46px;height:34px;flex:none;border-radius:9px;border:1px solid rgba(255,255,255,.22)}
+.actions{display:flex;gap:8px;margin-top:18px;justify-content:flex-end;flex-wrap:wrap}
+.actions .ghost{margin-right:auto;background:transparent;color:var(--muted)}
+.actions .primary{background:var(--accent);color:#04141d;border-color:transparent;font-weight:600}
+.actions .primary:hover{background:#8ce2ff;color:#04141d}
+@media(max-width:600px){
+  .wrap{padding:20px 14px 36px}
+  h1{font-size:20px}
+  .grid{grid-template-columns:1fr;gap:12px}
+  .card{padding:14px}
+  .sheet{padding:17px;border-radius:17px}
+  .swatches{grid-template-columns:repeat(8,1fr);gap:6px}
+}
+@media(prefers-reduced-motion:reduce){.card,.cdot,.sw{transition:none}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div><h1>60 颗灯带</h1></div>
+    <div style="flex:1"></div>
+    <span class="pill"><span class="dot"></span><span id="curMode">自动</span></span>
+    <span class="pill" id="curState">灯效：—</span>
+    <button class="pill linkpill good" id="linkBadge" title="点击查看串口连接详情">
+      <span class="licon" id="linkIcon">●</span><span id="linkText">串口正常</span>
+    </button>
+  </header>
+
+  <div class="grid" id="grid"></div>
+
+  <div class="foot">
+    <span class="ver">© 2026 Ethan · <span id="verBox">—</span></span>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<!-- 串口链路详情：断线 / 重连失败时点顶部胶囊打开 -->
+<div class="mask" id="linkMask">
+  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="linkTitle">
+    <h2 id="linkTitle">串口连接状态</h2>
+    <p class="hint" id="linkSummary">—</p>
+    <div class="lrow"><span class="k">当前状态</span><span class="v" id="lkState">—</span></div>
+    <div class="lrow"><span class="k">端口</span><span class="v" id="lkPort">—</span></div>
+    <div class="lrow"><span class="k">设备身份</span><span class="v" id="lkDevice">—</span></div>
+    <div class="lrow"><span class="k">设备绑定</span><span class="v" id="lkBind">—</span></div>
+    <div class="lrow"><span class="k">断开时间</span><span class="v" id="lkSince">—</span></div>
+    <div class="lrow"><span class="k">已重试</span><span class="v" id="lkAttempts">—</span></div>
+    <div class="lrow"><span class="k">下次重试</span><span class="v" id="lkDelay">—</span></div>
+    <div class="lrow"><span class="k">最后错误</span><span class="v" id="lkError">—</span></div>
+    <div class="lrow"><span class="k">可用串口</span><span class="v" id="lkPorts">—</span></div>
+    <pre class="lpre" id="lkDetail">—</pre>
+    <div class="actions"><button class="primary" id="linkCloseBtn">关闭</button></div>
+  </div>
+</div>
+
+<div class="mask" id="mask">
+  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="pickTitle">
+    <h2 id="pickTitle">选择颜色</h2>
+    <p class="hint colorOnly">即点即生效，无需保存。色轮圆心偏白、边缘纯色。</p>
+    <div class="wheel colorOnly" id="wheel"><div class="wheel-dot" id="wheelDot"></div></div>
+    <div class="swatches colorOnly" id="swatches"></div>
+    <div class="row">
+      <label>整体强度</label>
+      <input type="range" id="lvRange" min="10" max="100" step="1" value="50">
+      <span class="val" id="lvVal">50%</span>
+    </div>
+    <div class="hexrow colorOnly" id="hexRow">
+      <input type="text" id="hexInput" maxlength="7" spellcheck="false" aria-label="十六进制颜色">
+      <span class="prev" id="prevBox"></span>
+    </div>
+    <div class="actions">
+      <button class="ghost" id="resetBtn">恢复默认</button>
+      <button class="primary" id="doneBtn">完成</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const BASE = "/esp60led";
+const N = 14;
+const OFF = [24, 27, 33];
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+function hsv(h, s, v) {
+  const c = v * s, x = c * (1 - Math.abs((h / 60) % 2 - 1)), m = v - c;
+  let r = 0, g = 0, b = 0;
+  if (h < 60) { r = c; g = x; }
+  else if (h < 120) { r = x; g = c; }
+  else if (h < 180) { g = c; b = x; }
+  else if (h < 240) { g = x; b = c; }
+  else if (h < 300) { r = x; b = c; }
+  else { r = c; b = x; }
+  return [Math.round((r + m) * 255), Math.round((g + m) * 255), Math.round((b + m) * 255)];
+}
+function rgbHsv(rgb) {
+  const r = rgb[0] / 255, g = rgb[1] / 255, b = rgb[2] / 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+  let h = 0;
+  if (d) {
+    if (mx === r) h = 60 * (((g - b) / d) % 6);
+    else if (mx === g) h = 60 * ((b - r) / d + 2);
+    else h = 60 * ((r - g) / d + 4);
+  }
+  if (h < 0) h += 360;
+  return [h, mx ? d / mx : 0];
+}
+function hash01(i, t) {
+  const v = Math.sin(i * 12.9898 + t * 7.0) * 43758.5453;
+  return v - Math.floor(v);
+}
+const S = (c, k) => [Math.round(c[0] * k), Math.round(c[1] * k), Math.round(c[2] * k)];
+const tone = (c, lv) => S(c, clamp(lv, 0, 1));
+const CHASE = [[255, 40, 40], [60, 255, 80], [60, 120, 255], [255, 190, 40]];
+const SWATCHES = ["#FFFFFF", "#FFC896", "#FF5F14", "#FF3B30", "#FF2D7A", "#C77DFF", "#7B61FF", "#3B82F6",
+                  "#38BDF8", "#00E5FF", "#2EE6A8", "#22C55E", "#A3E635", "#FACC15", "#FB923C", "#94A3B8"];
+
+/* 与 Python 端 idle_frame() 同一套公式，只少了 cap 归一化（预览用感知色显示）。
+   TINT/GAIN 由 /api/status 下发，选完颜色立刻同步，预览跟着变。 */
+const PREVIEW = {
+  auto:     () => OFF,
+  off:      () => OFF,
+  rainbow:  (t, i, n) => tone(hsv((t * 40 + i / (n - 1) * 300) % 360, .9, 1), GAIN.rainbow),
+  breathe:  (t) => tone(TINT.breathe, GAIN.breathe * (.03 + .97 * (.5 - .5 * Math.cos(2 * Math.PI * t / 4)))),
+  solid:    () => tone(TINT.solid, GAIN.solid),
+  comet:    (t, i, n) => {
+    const pos = Math.floor(t / .075) % 60, head = 59 - pos;
+    const led = Math.round(i * 59 / Math.max(1, n - 1));
+    const k = ((led - head) % 60 + 60) % 60;
+    if (k >= 10) return [0, 0, 0];
+    const f = k / 9, b = TINT.comet;
+    const c = [Math.floor(b[0] * (1 - .55 * f)),
+               Math.floor(b[1] * (1 - .85 * f)),
+               Math.floor(b[2] * (1 - .95 * f))];
+    return tone(c, Math.pow(.5, k) * GAIN.comet);
+  },
+  wave:     (t, i, n) => {
+    const x = i / (n - 1), w = .5 + .5 * Math.sin(2 * Math.PI * (x * 2 - t * .35));
+    return tone(TINT.wave, GAIN.wave * (.02 + .98 * Math.pow(w, 1.7)));
+  },
+  chase:    (t, i, n) => {
+    const x = i / (n - 1), ph = x * 8 + t * 2, f = ph % 1;
+    return tone(CHASE[Math.floor(ph) % 4],
+                (f < .78 ? 1 : Math.max(0, (1 - f) / .22)) * GAIN.chase);
+  },
+  fire:     (t, i, n) => {
+    const x = i / (n - 1);
+    const noise = .50 * Math.sin(x * 11 + t * 7.3)
+                + .30 * Math.sin(x * 23 - t * 11.1 + 1.7)
+                + .20 * Math.sin(x * 41 + t * 5.7 + 3.1);
+    const height = .62 + .30 * Math.sin(2 * Math.PI * t / 2.4)
+                 + .08 * Math.sin(2 * Math.PI * t / .9);
+    const env = Math.pow(Math.max(0, 1 - x / Math.max(.12, height)), 1.4);
+    return tone(TINT.fire, GAIN.fire * env * (.55 + .45 * (.5 + .5 * noise)));
+  },
+  aurora:   (t, i, n) => {
+    const x = i / (n - 1), h = 120 + 80 * Math.sin(x * 3 + t * .5);
+    const w = .5 + .5 * Math.sin(x * 5 - t * .8);
+    return tone(hsv(((h % 360) + 360) % 360, .85, 1),
+                (.04 + .96 * Math.pow(w, 1.4)) * GAIN.aurora);
+  },
+  twinkle:  (t, i) => {
+    const seed = Math.floor(t * 3);
+    if (hash01(i, seed * .31) <= .84) return [0, 0, 0];
+    const ph = hash01(i * 5, seed * .17);
+    return tone(TINT.twinkle, GAIN.twinkle * (.20 + .80 * Math.abs(Math.sin(t * 2.2 + ph * Math.PI))));
+  },
+  gradient: (t, i, n) => {
+    const x = i / (n - 1), a = [60, 120, 255], b = [255, 90, 170];
+    return tone(a.map((v, j) => Math.round(v + (b[j] - v) * x)), GAIN.gradient);
+  }
+};
+
+let modes = [], current = "auto", live = null, polling = false;
+let COLOR_MODES = [], DECOR_MODES = [], colors = {}, levels = {},
+    defaultColors = {}, TINT = {}, GAIN = {}, DEFAULT_LEVEL = 0.5;
+const cards = new Map(), visible = new Set();
+const grid = document.getElementById("grid");
+
+function hexRgb(h) {
+  const s = String(h || "").replace("#", "");
+  return [parseInt(s.slice(0, 2), 16), parseInt(s.slice(2, 4), 16), parseInt(s.slice(4, 6), 16)];
+}
+function rgbHex(c) {
+  return "#" + c.map(v => clamp(Math.round(v), 0, 255).toString(16).padStart(2, "0")).join("").toUpperCase();
+}
+function normHex(s) {
+  let h = String(s || "").trim().replace(/^#/, "");
+  if (/^[0-9a-fA-F]{3}$/.test(h)) h = h.split("").map(c => c + c).join("");
+  return /^[0-9a-fA-F]{6}$/.test(h) ? "#" + h.toUpperCase() : null;
+}
+function applyColors() {
+  COLOR_MODES.forEach(k => {
+    const v = colors[k];
+    TINT[k] = hexRgb(v ? v.hex : defaultColors[k]);
+  });
+}
+function applyLevels() {
+  // 强度对全部 12 个 PREVIEW 都生效（不只支持自定义颜色的 6 种），
+  // 没单独设置过的模式一律用默认 50%。
+  Object.keys(PREVIEW).forEach(k => {
+    GAIN[k] = (levels[k] == null ? DEFAULT_LEVEL : levels[k]);
+  });
+}
+
+function svgFor(key) {
+  let dots = "";
+  for (let i = 0; i < N; i++) {
+    const x = 5 + i * (230 / N);
+    dots += `<rect class="d" x="${x.toFixed(1)}" y="7" width="${(230 / N - 4).toFixed(1)}" height="18" rx="5" fill="rgb(24,27,33)"/>`;
+  }
+  return `<svg class="strip" viewBox="0 0 240 32" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+    <rect x="0" y="0" width="240" height="32" rx="9" fill="rgba(0,0,0,.38)" stroke="rgba(255,255,255,.07)" stroke-width="1"/>
+    ${dots}</svg>`;
+}
+
+function paintColorDot(key) {
+  const o = cards.get(key);
+  if (!o) return;
+  const b = o.el.querySelector(".cdot");
+  if (!b) return;
+  const colorable = COLOR_MODES.includes(key);
+  const hex = colorable
+    ? ((colors[key] && colors[key].hex) || defaultColors[key] || "#8A93A3")
+    : "#62D5FF";   // 多色配色模式：点只用来调强度，用强调色区分
+  b.style.setProperty("--c", hex);
+  b.title = colorable
+    ? "设置颜色与强度 · 当前 " + hex
+    : "调整整体强度 · 当前 " + Math.round((levels[key] == null ? DEFAULT_LEVEL : levels[key]) * 100) + "%";
+}
+
+function build(list) {
+  grid.innerHTML = "";
+  cards.clear(); visible.clear();
+  list.forEach(m => {
+    // 10 种装饰模式都有设置点：6 种可调颜色+强度，其余 4 种只调强度。
+    const adjustable = DECOR_MODES.includes(m.key);
+    const el = document.createElement("div");
+    el.className = "card" + (m.key === current ? " on" : "");
+    el.dataset.mode = m.key;
+    el.innerHTML = `<div class="chead"><span class="name">${m.label}</span><span class="key">${m.key}</span></div>
+                    <div class="desc">${m.desc}</div>${svgFor(m.key)}
+                    ${adjustable ? '<button class="cdot" aria-label="设置颜色与强度"></button>' : ''}`;
+    el.addEventListener("click", () => setMode(m.key));
+    if (adjustable) {
+      el.querySelector(".cdot").addEventListener("click", e => {
+        e.stopPropagation(); openPicker(m.key);
+      });
+    }
+    grid.appendChild(el);
+    cards.set(m.key, { el, dots: Array.from(el.querySelectorAll(".d")) });
+    io.observe(el);
+    if (adjustable) paintColorDot(m.key);
+  });
+  paintSelection();
+}
+
+const io = new IntersectionObserver(entries => {
+  entries.forEach(e => {
+    const k = e.target.dataset.mode;
+    if (e.isIntersecting) visible.add(k); else visible.delete(k);
+  });
+}, { threshold: .01 });
+
+function paintSelection() {
+  cards.forEach((o, k) => o.el.classList.toggle("on", k === current));
+  const m = modes.find(x => x.key === current);
+  document.getElementById("curMode").textContent = m ? m.label : current;
+}
+
+function liveColor(c) {
+  if (!c || c[0] + c[1] + c[2] < 3) return "rgb(24,27,33)";
+  const b = v => clamp(Math.round(v * 2.4 + 14), 0, 255);
+  return `rgb(${b(c[0])},${b(c[1])},${b(c[2])})`;
+}
+
+function render() {
+  const t = performance.now() / 1000;
+  visible.forEach(key => {
+    const card = cards.get(key);
+    if (!card) return;
+    if (key === "auto" && current === "auto" && live && live.length === N) {
+      for (let i = 0; i < N; i++) card.dots[i].setAttribute("fill", liveColor(live[i]));
+      return;
+    }
+    const fn = PREVIEW[key];
+    if (!fn) return;
+    for (let i = 0; i < N; i++) {
+      const c = fn(t, i, N);
+      card.dots[i].setAttribute("fill",
+        `rgb(${clamp(c[0] | 0, 0, 255)},${clamp(c[1] | 0, 0, 255)},${clamp(c[2] | 0, 0, 255)})`);
+    }
+  });
+}
+
+function toast(msg) {
+  const t = document.getElementById("toast");
+  t.textContent = msg; t.classList.add("show");
+  clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove("show"), 1800);
+}
+
+async function setMode(key) {
+  current = key; paintSelection();
+  try {
+    const r = await fetch(`${BASE}/api/set?mode=${encodeURIComponent(key)}`, { cache: "no-store" });
+    const j = await r.json();
+    if (!j.ok) throw new Error("模式无效");
+    const m = modes.find(x => x.key === j.mode);
+    toast(`已切换：${m ? m.label : j.mode}`);
+  } catch (e) {
+    toast("切换失败：" + e.message);
+    refresh();
+  }
+}
+
+async function refresh() {
+  try {
+    const r = await fetch(`${BASE}/api/status`, { cache: "no-store" });
+    const j = await r.json();
+    const changed = !modes.length || j.modes.length !== modes.length;
+    modes = j.modes; current = j.mode;
+    COLOR_MODES = j.colorModes || [];
+    DECOR_MODES = j.decorModes || [];
+    defaultColors = j.defaultColors || {};
+    colors = j.colors || {};
+    levels = j.levels || {};
+    DEFAULT_LEVEL = (j.defaultLevel == null ? 0.5 : j.defaultLevel);
+    applyColors(); applyLevels();
+    updateLink(j.link);
+    if (j.version) {
+      document.getElementById("verBox").textContent =
+        (j.version.commit || "dev") + " · " + (j.version.updated || "—");
+    }
+    const names = { media: "放歌", mic: "麦克风", ambient: "环境彩虹", idle: "空闲" };
+    document.getElementById("curState").textContent = "灯效：" + (names[j.state] || j.state);
+    if (changed) build(modes);
+    else { paintSelection(); DECOR_MODES.forEach(paintColorDot); }
+  } catch (e) {
+    document.getElementById("curState").textContent = "服务未连接";
+  }
+}
+
+async function pollFrame() {
+  if (document.hidden || polling) return;
+  polling = true;
+  try {
+    const r = await fetch(`${BASE}/api/frame`, { cache: "no-store" });
+    const j = await r.json();
+    live = j.live;
+    updateLink(j.link);
+    if (j.mode !== current) { current = j.mode; paintSelection(); }
+    const names = { media: "放歌", mic: "麦克风", ambient: "环境彩虹", idle: "空闲" };
+    document.getElementById("curState").textContent = "灯效：" + (names[j.state] || j.state);
+  } catch (e) {
+    live = null;
+  } finally {
+    polling = false;
+  }
+}
+
+/* ---------- 串口链路状态：断线/重连失败时顶部胶囊 + 详情模态框 ---------- */
+let LINK = {state: "up", port: "", error: "", since: "", attempts: 0,
+            next_delay: 0, history: [], ports: [], detail: "",
+            device: {}, profile: {}, bound: false};
+
+function fillLinkDetail() {
+  const l = LINK;
+  const names = {up: "正常", retry: "断开，正在自动重连", down: "连接失败 / 已放弃重连"};
+  const set = (id, v) => { document.getElementById(id).textContent = v; };
+  set("lkState", names[l.state] || l.state || "—");
+  set("lkPort", l.port || "—");
+  const d = l.device || {};
+  set("lkDevice", d.model
+      ? (d.legacy
+         ? "固件 v5 · 未烧录身份证（烧 v6 后可自动识别串口）"
+         : (d.model + " · 固件 v" + d.version + " · 序列号 " + d.serial))
+      : "（未识别到设备）");
+  const p = l.profile || {};
+  set("lkBind", p.serial
+      ? ("序列号 " + p.serial + (p.port ? "（上次在 " + p.port + "）" : "")
+         + " · 只看这一台，换 USB 口也认")
+      : "未绑定 · 首次连接时只有一台会自动记住，多台会询问");
+  set("lkSince", l.since || "—");
+  set("lkAttempts", (l.attempts || 0) + " 次");
+  set("lkDelay", l.next_delay ? (l.next_delay + " 秒后") : "—");
+  set("lkError", l.error || "—");
+  set("lkPorts", (l.ports || []).join("、") || "（未检测到串口）");
+  set("lkDetail", "最近重试记录：\n" + ((l.history || []).join("\n") || "（无）")
+                  + "\n\n" + (l.detail || ""));
+  set("linkSummary", l.state === "up"
+      ? "灯带与固件通信正常。这里可以随时查看当前端口与可用串口。"
+      : "灯带当前无法通信，灯效不会亮。下方是自动重连的详细记录与排查建议。");
+}
+function closeLinkDetail() {
+  document.getElementById("linkMask").classList.remove("show");
+}
+function updateLink(l) {
+  if (!l) return;
+  LINK = l;
+  const b = document.getElementById("linkBadge");
+  const icon = document.getElementById("linkIcon");
+  const txt = document.getElementById("linkText");
+  b.classList.remove("good", "warn", "bad");
+  if (l.state === "retry") {
+    b.classList.add("warn"); icon.textContent = "⚠";
+    txt.textContent = "串口断开 · 重连中 " + (l.attempts || 0);
+  } else if (l.state === "down") {
+    b.classList.add("bad"); icon.textContent = "⚠";
+    txt.textContent = "串口连接失败";
+  } else {
+    b.classList.add("good"); icon.textContent = "●";
+    txt.textContent = (l.port ? l.port + " 正常" : "串口正常");
+  }
+  // 详情开着时同步刷新，重试次数会自己往上走
+  if (document.getElementById("linkMask").classList.contains("show")) fillLinkDetail();
+}
+document.getElementById("linkBadge").addEventListener("click", () => {
+  fillLinkDetail();
+  document.getElementById("linkMask").classList.add("show");
+});
+document.getElementById("linkCloseBtn").addEventListener("click", closeLinkDetail);
+document.getElementById("linkMask").addEventListener("click", e => {
+  if (e.target.id === "linkMask") closeLinkDetail();
+});
+
+/* ---------- 设置模态框：颜色 + 强度，即点即生效，无保存按钮 ---------- */
+const mask = document.getElementById("mask");
+const wheel = document.getElementById("wheel");
+const wheelDot = document.getElementById("wheelDot");
+const hexInput = document.getElementById("hexInput");
+const lvRange = document.getElementById("lvRange");
+let pickerMode = "", pickHex = "#FFFFFF", dragging = false;
+let colorTimer = null, colorSeq = 0, levelTimer = null, levelSeq = 0;
+
+/* 颜色与强度走两条独立接口：拖滑块不带颜色，选颜色不动强度。
+   拖动过程 120ms 节流，松手补发最终值，避免刷爆 HTTP。 */
+function scheduleColor(now) {
+  const hex = normHex(hexInput.value) || pickHex;
+  clearTimeout(colorTimer);
+  if (now) pushColor(hex);
+  else colorTimer = setTimeout(() => pushColor(hex), 120);
+}
+async function pushColor(hex) {
+  const seq = ++colorSeq;
+  try {
+    const r = await fetch(`${BASE}/api/setcolor?mode=${encodeURIComponent(pickerMode)}&hex=${encodeURIComponent(hex)}`, { cache: "no-store" });
+    const j = await r.json();
+    if (!j.ok) throw new Error("参数无效");
+    if (seq !== colorSeq) return;              // 丢弃过期响应，快速连点不回跳
+    colors[pickerMode] = { hex };
+    applyColors(); paintColorDot(pickerMode);
+  } catch (e) { toast("颜色应用失败：" + e.message); }
+}
+function scheduleLevel(now) {
+  const lv = (+lvRange.value) / 100;
+  clearTimeout(levelTimer);
+  if (now) pushLevel(lv);
+  else levelTimer = setTimeout(() => pushLevel(lv), 120);
+}
+async function pushLevel(lv) {
+  const seq = ++levelSeq;
+  try {
+    const r = await fetch(`${BASE}/api/setlevel?mode=${encodeURIComponent(pickerMode)}&level=${lv}`, { cache: "no-store" });
+    const j = await r.json();
+    if (!j.ok) throw new Error("参数无效");
+    if (seq !== levelSeq) return;
+    levels[pickerMode] = lv;
+    applyLevels(); paintColorDot(pickerMode);
+  } catch (e) { toast("强度应用失败：" + e.message); }
+}
+
+/* 打开设置时静默切到该模式，点颜色/拖强度才能在灯带上直接看到 */
+function switchModeQuiet(key) {
+  if (current === key) return;
+  current = key; paintSelection();
+  fetch(`${BASE}/api/set?mode=${encodeURIComponent(key)}`, { cache: "no-store" }).catch(() => {});
+}
+
+SWATCHES.forEach(h => {
+  const b = document.createElement("button");
+  b.className = "sw"; b.style.setProperty("--c", h); b.title = h;
+  b.addEventListener("click", () => { setPickerColor(h); scheduleColor(true); });
+  document.getElementById("swatches").appendChild(b);
+});
+
+function placeDot(h, s) {
+  const R = wheel.clientWidth / 2, rad = h * Math.PI / 180;
+  wheelDot.style.left = (R + R * s * Math.sin(rad)) + "px";
+  wheelDot.style.top = (R - R * s * Math.cos(rad)) + "px";
+}
+function setPickerColor(hex) {
+  const h = normHex(hex);
+  if (!h) return;
+  pickHex = h;
+  hexInput.value = h;
+  document.getElementById("prevBox").style.background = h;
+  const [hue, sat] = rgbHsv(hexRgb(h));
+  placeDot(hue, sat);
+  document.querySelectorAll(".sw").forEach(b => b.classList.toggle("on", b.title === h));
+}
+function wheelPick(e) {
+  const r = wheel.getBoundingClientRect();
+  const cx = r.left + r.width / 2, cy = r.top + r.height / 2, R = r.width / 2;
+  let dx = e.clientX - cx, dy = e.clientY - cy;
+  const dist = Math.hypot(dx, dy), s = clamp(dist / R, 0, 1);
+  if (dist > R) { dx = dx * R / dist; dy = dy * R / dist; }
+  const hue = (Math.atan2(dx, -dy) * 180 / Math.PI + 360) % 360;
+  setPickerColor(rgbHex(hsv(hue, s, 1)));
+}
+wheel.addEventListener("pointerdown", e => {
+  dragging = true;
+  try { wheel.setPointerCapture(e.pointerId); } catch (_) {}
+  wheelPick(e); scheduleColor(false);
+});
+wheel.addEventListener("pointermove", e => {
+  if (dragging) { wheelPick(e); scheduleColor(false); }
+});
+wheel.addEventListener("pointerup", () => { dragging = false; scheduleColor(true); });
+wheel.addEventListener("pointercancel", () => { dragging = false; scheduleColor(true); });
+hexInput.addEventListener("change", () => {
+  const h = normHex(hexInput.value);
+  if (h) { setPickerColor(h); scheduleColor(true); }
+  else hexInput.value = pickHex;
+});
+lvRange.addEventListener("input", () => {
+  document.getElementById("lvVal").textContent = lvRange.value + "%";
+  scheduleLevel(false);
+});
+lvRange.addEventListener("change", () => scheduleLevel(true));
+
+function openPicker(key) {
+  pickerMode = key;
+  switchModeQuiet(key);
+  const colorable = COLOR_MODES.includes(key);
+  const m = modes.find(x => x.key === key);
+  // 多色配色模式没有自定义颜色，只留强度滑块
+  document.querySelectorAll(".colorOnly").forEach(el => {
+    el.style.display = colorable ? "" : "none";
+  });
+  document.getElementById("pickTitle").textContent =
+    (colorable ? "设置颜色与强度" : "调整整体强度") + " · " + (m ? m.label : key);
+  const lv = Math.round((levels[key] == null ? DEFAULT_LEVEL : levels[key]) * 100);
+  lvRange.value = lv;
+  document.getElementById("lvVal").textContent = lv + "%";
+  mask.classList.add("show");
+  // show 之后 wheel 才有 clientWidth，placeDot 才能算对位置
+  if (colorable) setPickerColor((colors[key] && colors[key].hex) || defaultColors[key]);
+}
+function closePicker() {
+  clearTimeout(colorTimer); clearTimeout(levelTimer);
+  mask.classList.remove("show");
+  dragging = false;
+}
+mask.addEventListener("click", e => { if (e.target === mask) closePicker(); });
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") { closePicker(); closeLinkDetail(); }
+});
+document.getElementById("doneBtn").addEventListener("click", closePicker);
+document.getElementById("resetBtn").addEventListener("click", async () => {
+  const colorable = COLOR_MODES.includes(pickerMode);
+  try {
+    const r = await fetch(`${BASE}/api/resetcolor?mode=${encodeURIComponent(pickerMode)}`, { cache: "no-store" });
+    const j = await r.json();
+    if (!j.ok) throw new Error("参数无效");
+    delete colors[pickerMode]; delete levels[pickerMode];
+    applyColors(); applyLevels(); paintColorDot(pickerMode);
+    const lv = Math.round(DEFAULT_LEVEL * 100);
+    lvRange.value = lv; document.getElementById("lvVal").textContent = lv + "%";
+    if (colorable) setPickerColor(defaultColors[pickerMode]);  // 接口已恢复，不必再推
+    toast("已恢复默认");
+  } catch (e) { toast("恢复失败：" + e.message); }
+});
+
+refresh();
+pollFrame();
+setInterval(refresh, 5000);
+setInterval(pollFrame, 150);
+setInterval(render, 66);
+</script>
+</body>
+</html>
