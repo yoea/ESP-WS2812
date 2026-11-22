@@ -6,7 +6,12 @@
 <!-- iOS Safari：状态栏/顶栏用网页顶部同色，消除黑色与页面之间的硬分界。
      添加到主屏幕后下面三条让网页真正延伸到状态栏后面（black-translucent），
      状态栏文字浮在网页上；内容靠 env(safe-area-inset-top) 让开。 -->
-<meta name="theme-color" content="#171b31">
+<meta name="theme-color" content="#141f31">
+<!-- 图标：SVG 给现代浏览器（清晰），ICO 做兜底（Windows 桌面快捷方式认它），
+     PNG 给 iOS「添加到主屏幕」。全部走 /esp60led 前缀，见 start_panel 的静态资源分支。 -->
+<link rel="icon" href="/esp60led/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/esp60led/favicon.ico" sizes="any">
+<link rel="apple-touch-icon" href="/esp60led/apple-touch-icon.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -21,16 +26,24 @@
   --r:18px;
   color-scheme:dark;
 }
+/* 整页背景放在 html 上，而不是 body：
+   状态栏 / 地址栏那块区域是浏览器画在网页外面的，只有根元素（画布）的背景能铺到
+   那里。body 上画渐变的话，状态栏区域只会显示 html 的纯色兜底底，看起来就是
+   「上面一条纯色、下面渐变」的接缝。放 html 上整块画布是同一张渐变，无缝。
+   background-color 必须和 theme-color 一致，否则 iOS 浏览器模式顶部色条会对不上。 */
+html{
+  min-height:100%;
+  background-color:#141f31;
+  background-image:radial-gradient(1200px 620px at 12% -8%,#16243a 0%,transparent 58%),
+                   radial-gradient(900px 520px at 96% 4%,#251a38 0%,transparent 55%);
+  background-repeat:no-repeat;
+}
 *{box-sizing:border-box}
 html,body{margin:0;padding:0}
-/* 整页实色兜底：iOS standalone（black-translucent）下网页从 y=0 起绘制，
-   根节点底色与 theme-color 一致，状态栏区域不会出现一条纯黑。 */
-html{background:#171b31}
 body{
   min-height:100vh;
-  background:radial-gradient(1200px 620px at 12% -8%,#16243a 0%,transparent 58%),
-             radial-gradient(900px 520px at 96% 4%,#251a38 0%,transparent 55%),
-             var(--bg);
+  min-height:100dvh;
+  background:transparent;      /* 背景在 html 上，见上面那条注释 */
   color:var(--txt);
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
   -webkit-font-smoothing:antialiased;
@@ -44,18 +57,24 @@ h1{font-size:23px;font-weight:600;letter-spacing:-.4px;margin:0;
    -webkit-background-clip:text;background-clip:text;color:transparent}
 .pill{display:inline-flex;align-items:center;gap:7px;padding:6px 12px;border-radius:999px;
       border:1px solid var(--line);background:var(--card);font-size:12px;color:var(--muted)}
-/* 全灭开关：顶部一个很小的 switch，代替原来的「全灭」卡片 */
-.kill{display:inline-flex;align-items:center;gap:7px;cursor:pointer;user-select:none;
-      font-size:11.5px;color:var(--dim);padding:2px 0}
-.kill input{position:absolute;opacity:0;width:0;height:0}
-.kill .track{position:relative;width:30px;height:17px;border-radius:999px;
+/* 亮灭开关：与顶栏其他胶囊同风格（同边框、同底色、同字号）。
+   左「灭」右「亮」，滑块在右 = 亮（默认）。 */
+.swlit{display:inline-flex;align-items:center;gap:8px;padding:5px 12px;border-radius:999px;
+      border:1px solid var(--line);background:var(--card);font-size:12px;line-height:1;
+      color:var(--muted);cursor:pointer;user-select:none;transition:.18s}
+.swlit:hover{border-color:rgba(255,255,255,.2);background:var(--card-hi)}
+.swlit input{position:absolute;opacity:0;width:0;height:0}
+.swlit .track{position:relative;width:30px;height:16px;border-radius:999px;flex:none;
       background:rgba(255,255,255,.1);border:1px solid var(--line);transition:.18s}
-.kill .track::after{content:"";position:absolute;top:2px;left:2px;width:11px;height:11px;
+.swlit .track::after{content:"";position:absolute;top:2px;left:2px;width:10px;height:10px;
       border-radius:50%;background:#8992a3;transition:.18s}
-.kill input:checked+.track{background:rgba(255,72,72,.34);border-color:rgba(255,86,86,.62)}
-.kill input:checked+.track::after{left:15px;background:#ff8383}
-.kill input:checked~.klabel{color:#ff9d9d}
-.kill input:focus-visible+.track{outline:2px solid var(--accent);outline-offset:2px}
+.swlit input:checked~.track{background:rgba(98,213,255,.3);border-color:rgba(98,213,255,.55)}
+.swlit input:checked~.track::after{left:16px;background:var(--accent);
+      box-shadow:0 0 8px rgba(98,213,255,.7)}
+.swlit .swtxt{transition:.18s;color:var(--dim)}
+.swlit input:not(:checked)~.swtxt.off{color:var(--txt)}
+.swlit input:checked~.swtxt.on{color:var(--accent)}
+.swlit input:focus-visible~.track{outline:2px solid var(--accent);outline-offset:2px}
 /* GPU 卡片：把描述行换成实时占用率，等宽数字防跳动 */
 .gdesc{color:var(--muted)}
 .gdesc b{font-size:16px;font-weight:650;color:var(--accent);font-variant-numeric:tabular-nums;
@@ -69,6 +88,10 @@ h1{font-size:23px;font-weight:600;letter-spacing:-.4px;margin:0;
 .linkpill.bad{border-color:rgba(255,90,90,.6);background:rgba(255,60,60,.14);color:#ffb4b4;
               animation:linkpulse 1.6s ease-in-out infinite}
 @keyframes linkpulse{0%,100%{box-shadow:0 0 0 0 rgba(255,80,80,0)}50%{box-shadow:0 0 0 5px rgba(255,80,80,.13)}}
+/* 过渡间隔胶囊 + 弹窗里的预设按钮 */
+.wipepill{cursor:pointer}
+.wipepill span{color:var(--txt);font-variant-numeric:tabular-nums}
+.pill.sel{border-color:rgba(98,213,255,.6);background:var(--accent-soft);color:var(--accent)}
 .lrow{display:flex;gap:10px;padding:8px 0;border-bottom:1px solid var(--line);font-size:12.5px}
 /* display:flex 会盖掉浏览器给 [hidden] 的 display:none，必须自己补一条 */
 .lrow[hidden]{display:none}
@@ -89,10 +112,14 @@ button:active{transform:scale(.97)}
       transition:transform .2s,border-color .2s,background .2s,box-shadow .2s;
       -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px)}
 .card:hover{transform:translateY(-3px);background:var(--card-hi);border-color:rgba(255,255,255,.2)}
-.card.on{border-color:var(--line-hi);background:linear-gradient(160deg,var(--accent-soft),var(--card) 62%);
-         box-shadow:0 0 0 1px rgba(98,213,255,.18),0 14px 40px rgba(0,0,0,.32)}
+.card.on{border-color:rgba(98,213,255,.9);
+         background:linear-gradient(160deg,rgba(98,213,255,.26),rgba(98,213,255,.07) 58%,var(--card-hi) 100%);
+         box-shadow:0 0 0 2px rgba(98,213,255,.45),0 0 30px rgba(98,213,255,.3),0 16px 42px rgba(0,0,0,.42)}
+.card.on:hover{border-color:#8ce2ff}
+.card.on .name{color:#fff}
 .card.on::after{content:"当前";position:absolute;top:14px;right:46px;font-size:11px;
-      color:#04141d;background:var(--accent);padding:3px 9px;border-radius:999px;font-weight:600}
+      color:#04141d;background:var(--accent);padding:3px 9px;border-radius:999px;font-weight:700;
+      box-shadow:0 0 12px rgba(98,213,255,.65)}
 .chead{display:flex;align-items:baseline;gap:9px;padding-right:52px}
 .name{font-size:15px;font-weight:600;letter-spacing:.2px}
 .key{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;color:var(--dim)}
@@ -118,7 +145,9 @@ button:active{transform:scale(.97)}
       padding:16px;background:rgba(4,7,12,.74);
       -webkit-backdrop-filter:blur(9px);backdrop-filter:blur(9px)}
 .mask.show{display:flex}
-.sheet{width:min(420px,100%);max-height:calc(100vh - 32px);overflow:auto;
+.sheet{width:min(420px,100%);max-height:calc(100vh - 32px);
+       max-height:calc(100dvh - 32px);   /* 手机地址栏收起/展开时不至于顶出屏幕 */
+       overflow:auto;
        padding:20px;border-radius:20px;border:1px solid rgba(255,255,255,.15);
        background:linear-gradient(160deg,#182231,#10151e 72%);
        box-shadow:0 24px 70px rgba(0,0,0,.65)}
@@ -151,13 +180,45 @@ input[type=range]{flex:1;accent-color:var(--accent);height:22px}
 .actions .ghost{margin-right:auto;background:transparent;color:var(--muted)}
 .actions .primary{background:var(--accent);color:#04141d;border-color:transparent;font-weight:600}
 .actions .primary:hover{background:#8ce2ff;color:#04141d}
+/* ---------- 手机端：两列紧凑布局，一屏能看到大部分卡片 ---------- */
 @media(max-width:600px){
-  .wrap{padding:20px 14px 36px}
-  h1{font-size:20px}
-  .grid{grid-template-columns:1fr;gap:12px}
-  .card{padding:14px}
-  .sheet{padding:17px;border-radius:17px}
+  .wrap{padding:12px 12px 26px}
+  header{gap:8px 10px;margin-bottom:4px;align-items:center}
+  h1{font-size:17px}
+  /* 顶栏三个胶囊缩一号，争取和标题挤在同一行 */
+  .pill{font-size:11.5px;padding:5px 10px;gap:5px}
+  .swlit{padding:4px 9px;gap:6px}
+  .swlit .track{width:28px;height:15px}
+  .swlit input:checked~.track::after{left:15px}
+  /* minmax(0,1fr) 而不是 1fr：SVG 的固有宽度是 viewBox 的 240px，
+     用 1fr 时列宽会被它撑到 240 以上，两列直接把页面顶出视口。 */
+  .grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:14px}
+  .card{padding:11px 11px 9px;border-radius:15px;min-width:0;
+        display:flex;flex-direction:column}
+  /* 悬停位移在触摸屏上只会留下「按下去弹不回来」的错觉 */
+  .card:hover{transform:none}
+  .chead{gap:6px;padding-right:32px}
+  .name{font-size:13.5px;letter-spacing:0}
+  .key{display:none}                 /* 窄卡片里英文 key 纯占地方 */
+  .desc{font-size:11px;line-height:1.45;margin:3px 0 8px;min-height:0;
+        display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;
+        overflow:hidden;text-overflow:ellipsis}
+  .gdesc b{font-size:14px}
+  .cdot{width:22px;height:22px;top:9px;right:9px;border-width:2px}
+  /* 「当前」徽章要给右边的颜色圆点（22px + 9px 边距）让出位置，否则两坨会贴在一起 */
+  .card.on::after{top:9px;right:38px;font-size:9.5px;padding:2px 6px;letter-spacing:0}
+  .strip{border-radius:8px;min-width:0;margin-top:auto}
+  .foot{margin-top:18px;padding-top:12px;font-size:11px}
+  .mask{padding:10px}
+  .sheet{padding:16px;border-radius:16px}
   .swatches{grid-template-columns:repeat(8,1fr);gap:6px}
+  .toast{bottom:calc(18px + env(safe-area-inset-bottom))}
+}
+/* 超窄屏（iPhone SE 这类）两列实在放不下，退回单列 */
+@media(max-width:380px){
+  .grid{grid-template-columns:1fr}
+  .name{font-size:14px}
+  .desc{font-size:11.5px;-webkit-line-clamp:3}
 }
 @media(prefers-reduced-motion:reduce){.card,.cdot,.sw{transition:none}}
 </style>
@@ -167,13 +228,15 @@ input[type=range]{flex:1;accent-color:var(--accent);height:22px}
   <header>
     <div><h1>60 颗灯带</h1></div>
     <div style="flex:1"></div>
-    <label class="kill" title="全灭：整条强制不亮，覆盖任何灯效；关掉回到上一个模式">
-      <input type="checkbox" id="killSw">
+    <label class="swlit" title="亮：正常出灯效；灭：整条强制不亮，覆盖任何灯效，切回亮恢复上一个模式">
+      <input type="checkbox" id="swLit" checked>
+      <span class="swtxt off">灭</span>
       <span class="track"></span>
-      <span class="klabel">全灭</span>
+      <span class="swtxt on">亮</span>
     </label>
-    <span class="pill"><span class="dot"></span><span id="curMode">自动</span></span>
-    <span class="pill" id="curState">灯效：—</span>
+    <button class="pill wipepill" id="wipeBadge" title="亮灭切换时逐颗点亮 / 熄灭的间隔，点击调节">
+      过渡 <span id="wipeVal">5ms</span>
+    </button>
     <button class="pill linkpill good" id="linkBadge" title="点击查看串口连接详情">
       <span class="licon" id="linkIcon">●</span><span id="linkText">串口正常</span>
     </button>
@@ -203,6 +266,30 @@ input[type=range]{flex:1;accent-color:var(--accent);height:22px}
     <div class="lrow"><span class="k">可用串口</span><span class="v" id="lkPorts">—</span></div>
     <pre class="lpre" id="lkDetail">—</pre>
     <div class="actions"><button class="primary" id="linkCloseBtn">关闭</button></div>
+  </div>
+</div>
+
+<!-- 亮灭过渡：逐颗点亮 / 熄灭的间隔，拖着试最快 -->
+<div class="mask" id="wipeMask">
+  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="wipeTitle">
+    <h2 id="wipeTitle">亮灭过渡</h2>
+    <p class="hint">切换顶部开关时，60 颗灯逐颗点亮 / 熄灭。数值是<b>每颗之间</b>的间隔，
+      越小越快。调完拨一下开关就能试出来。</p>
+    <div class="row">
+      <label for="wipeRange">间隔</label>
+      <!-- 0~100 是对数刻度：0.5~60ms。线性刻度下 5ms 会挤在最左端没法微调 -->
+      <input type="range" id="wipeRange" min="0" max="100" step="1" value="48">
+      <span class="val" id="wipeVal2">5ms</span>
+    </div>
+    <div class="row" style="flex-wrap:wrap;gap:8px">
+      <button class="pill" data-ms="1">1ms</button>
+      <button class="pill" data-ms="5">5ms</button>
+      <button class="pill" data-ms="10">10ms</button>
+      <button class="pill" data-ms="20">20ms</button>
+      <button class="pill" data-ms="50">50ms</button>
+    </div>
+    <p class="hint" id="wipeTotal" style="margin:14px 0 0">—</p>
+    <div class="actions"><button class="primary" id="wipeCloseBtn">关闭</button></div>
   </div>
 </div>
 
@@ -271,8 +358,8 @@ const SWATCHES = ["#FFFFFF", "#FFC896", "#FF5F14", "#FF3B30", "#FF2D7A", "#C77DF
 let GPU = { load: 0, percent: 0, available: false, engines: 0 };
 // 颗数分段：0~10% → 11 颗、10~90% → 11~49 颗、90~100% → 49~60 颗
 const GPU_CNT_STOPS = [[0, 0], [.10, 11], [.90, 49], [1, 60]];
-// 色相：绿 120° → 黄 60° → 橙 30° → 红 0° → 紫红 -40°
-const GPU_HUE_STOPS = [[0, 120], [.10, 120], [.35, 60], [.60, 30], [.85, 0], [1, -40]];
+// 颜色（无青/蓝/紫）：沿色环 120°→0° 连续渐变（绿→黄→橙→红），95% 起纯红
+const GPU_HUE_STOPS = [[0, 120], [.10, 110], [.45, 60], [.70, 30], [.95, 0], [1, 0]];
 
 function piecewise(x, stops) {
   x = clamp(x, 0, 1);
@@ -282,6 +369,21 @@ function piecewise(x, stops) {
     if (x <= x1) return x1 <= x0 ? y1 : y0 + (y1 - y0) * (x - x0) / (x1 - x0);
   }
   return stops[stops.length - 1][1];
+}
+
+/* 占用率 -> RGB：色环上 120°→0° 的连续渐变（对应 Python gpu_color） */
+function gpuColor(x) {
+  return hsv(piecewise(x, GPU_HUE_STOPS), 1, 1);
+}
+
+/* 亮 k 颗 -> 该颗被点亮时的占用率阈值（gpu_led_count 的反函数） */
+function gpuLoadAtCount(k) {
+  for (let j = 1; j < GPU_CNT_STOPS.length; j++) {
+    const x0 = GPU_CNT_STOPS[j - 1][0], y0 = GPU_CNT_STOPS[j - 1][1];
+    const x1 = GPU_CNT_STOPS[j][0], y1 = GPU_CNT_STOPS[j][1];
+    if (k <= y1) return y1 <= y0 ? x1 : x0 + (x1 - x0) * (k - y0) / (y1 - y0);
+  }
+  return 1;
 }
 
 /* 与 Python 端 idle_frame() 同一套公式，只少了 cap 归一化（预览用感知色显示）。
@@ -295,8 +397,9 @@ const PREVIEW = {
     if (load <= 0) return OFF;
     const cnt = piecewise(load, GPU_CNT_STOPS) * n / 60;
     if (i >= cnt) return OFF;
-    const hue = ((piecewise(load, GPU_HUE_STOPS) % 360) + 360) % 360;
-    return tone(hsv(hue, 1, 1), Math.min(1, cnt - i) * GAIN.gpu);
+    // 每颗灯的颜色由它自己的阈值定死（固定渐变），不随当前读数变色
+    const col = gpuColor(gpuLoadAtCount((i + .5) * 60 / n));
+    return tone(col, Math.min(1, cnt - i) * GAIN.gpu);
   },
   rainbow:  (t, i, n) => tone(hsv((t * 40 + i / (n - 1) * 300) % 360, .9, 1), GAIN.rainbow),
   breathe:  (t) => tone(TINT.breathe, GAIN.breathe * (.03 + .97 * (.5 - .5 * Math.cos(2 * Math.PI * t / 4)))),
@@ -410,7 +513,7 @@ function paintColorDot(key) {
 function build(list) {
   grid.innerHTML = "";
   cards.clear(); visible.clear();
-  // 「全灭」不再是一张卡片，改到顶栏那个小 switch 了
+  // 「灭」不再是卡片，改成顶栏那个亮灭开关了
   list.filter(m => m.key !== "off").forEach(m => {
     // 10 种装饰模式都有设置点：6 种可调颜色+强度，其余 4 种只调强度。
     const adjustable = DECOR_MODES.includes(m.key);
@@ -446,12 +549,8 @@ const io = new IntersectionObserver(entries => {
 
 function paintSelection() {
   cards.forEach((o, k) => o.el.classList.toggle("on", k === current));
-  const m = modes.find(x => x.key === current);
-  // off 没有卡片了，直接显示「全灭」而不是内部 key
-  document.getElementById("curMode").textContent =
-    m ? m.label : (current === "off" ? "全灭" : current);
-  const sw = document.getElementById("killSw");
-  if (sw) sw.checked = (current === "off");
+  const sw = document.getElementById("swLit");
+  if (sw) sw.checked = (current !== "off");
 }
 
 function paintGpu() {
@@ -521,16 +620,15 @@ async function refresh() {
     applyColors(); applyLevels();
     updateLink(j.link);
     if (j.gpu) { GPU = j.gpu; paintGpu(); }
+    if (j.wipeMs != null) { WIPE_MS = j.wipeMs; paintWipe(); }
     if (j.version) {
       document.getElementById("verBox").textContent =
         (j.version.commit || "dev") + " · " + (j.version.updated || "—");
     }
-    const names = { media: "放歌", mic: "麦克风", ambient: "环境彩虹", idle: "空闲" };
-    document.getElementById("curState").textContent = "灯效：" + (names[j.state] || j.state);
     if (changed) build(modes);
     else { paintSelection(); DECOR_MODES.forEach(paintColorDot); }
   } catch (e) {
-    document.getElementById("curState").textContent = "服务未连接";
+    // 顶栏不再显示灯效状态，连接失败只体现在串口胶囊上
   }
 }
 
@@ -544,8 +642,6 @@ async function pollFrame() {
     updateLink(j.link);
     if (j.gpu) { GPU = j.gpu; paintGpu(); }
     if (j.mode !== current) { current = j.mode; paintSelection(); }
-    const names = { media: "放歌", mic: "麦克风", ambient: "环境彩虹", idle: "空闲" };
-    document.getElementById("curState").textContent = "灯效：" + (names[j.state] || j.state);
   } catch (e) {
     live = null;
   } finally {
@@ -654,6 +750,80 @@ document.getElementById("linkBadge").addEventListener("click", () => {
 document.getElementById("linkCloseBtn").addEventListener("click", closeLinkDetail);
 document.getElementById("linkMask").addEventListener("click", e => {
   if (e.target.id === "linkMask") closeLinkDetail();
+});
+
+/* ---------- 亮灭过渡间隔：顶部「过渡」胶囊打开弹窗调 ---------- */
+let WIPE_MS = 5, wipeTimer = null;
+const wipeRange = document.getElementById("wipeRange");
+const WIPE_MIN = 0.5, WIPE_MAX = 60;      // 与后端 WIPE_STEP_MIN/MAX_MS 保持一致
+
+// 滑块用对数刻度：线性的话 5ms 会贴在 0.5~60 的最左端，根本没法微调
+const msToPos = ms =>
+  clamp(Math.log(clamp(ms, WIPE_MIN, WIPE_MAX) / WIPE_MIN) /
+        Math.log(WIPE_MAX / WIPE_MIN), 0, 1) * 100;
+const posToMs = v =>
+  Math.round(WIPE_MIN * Math.pow(WIPE_MAX / WIPE_MIN, clamp(v, 0, 100) / 100) * 10) / 10;
+
+function fmtMs(v) {
+  const s = (Math.round(v * 10) / 10).toString();
+  return s.replace(/\.0$/, "") + "ms";
+}
+
+function paintWipe() {
+  const t = fmtMs(WIPE_MS);
+  document.getElementById("wipeVal").textContent = t;
+  document.getElementById("wipeVal2").textContent = t;
+  if (wipeRange) {
+    const pos = Math.round(msToPos(WIPE_MS));
+    if (Number(wipeRange.value) !== pos) wipeRange.value = pos;
+  }
+  // 总时长 = 间隔 × 60 颗；少于 20ms 时每帧会一次推进多颗（渲染 50Hz）
+  const total = WIPE_MS * 60 / 1000;
+  const perFrame = 20 / WIPE_MS;
+  document.getElementById("wipeTotal").textContent =
+    "整条 60 颗约 " + total.toFixed(2) + " 秒扫完" +
+    (perFrame > 1.05
+      ? "（渲染 50Hz，每帧推进约 " + Math.ceil(perFrame) + " 颗，再快也看不出逐颗）"
+      : "（每帧最多推进 1 颗，逐颗清晰可数）");
+  document.querySelectorAll("#wipeMask .pill[data-ms]").forEach(b =>
+    b.classList.toggle("sel", Number(b.dataset.ms) === WIPE_MS));
+}
+
+async function pushWipe(ms) {
+  try {
+    const r = await fetch(`${BASE}/api/wipe?ms=${encodeURIComponent(ms)}`, { cache: "no-store" });
+    const j = await r.json();
+    if (j.wipeMs != null) WIPE_MS = j.wipeMs;    // 后端会夹到合法区间，以它为准
+  } catch (e) {
+    toast("过渡间隔设置失败：" + e.message);
+  }
+  paintWipe();
+}
+
+// 拖滑块时本地立刻跟手，150ms 后再提交，别把 HTTP 刷爆
+wipeRange.addEventListener("input", () => {
+  WIPE_MS = posToMs(Number(wipeRange.value));
+  paintWipe();
+  clearTimeout(wipeTimer);
+  wipeTimer = setTimeout(() => pushWipe(WIPE_MS), 150);
+});
+document.querySelectorAll("#wipeMask .pill[data-ms]").forEach(b => {
+  b.addEventListener("click", () => {
+    WIPE_MS = Number(b.dataset.ms);
+    paintWipe();
+    clearTimeout(wipeTimer);
+    pushWipe(WIPE_MS);
+  });
+});
+document.getElementById("wipeBadge").addEventListener("click", () => {
+  paintWipe();
+  document.getElementById("wipeMask").classList.add("show");
+});
+document.getElementById("wipeCloseBtn").addEventListener("click", () => {
+  document.getElementById("wipeMask").classList.remove("show");
+});
+document.getElementById("wipeMask").addEventListener("click", e => {
+  if (e.target.id === "wipeMask") e.target.classList.remove("show");
 });
 
 /* ---------- 设置模态框：颜色 + 强度，即点即生效，无保存按钮 ---------- */
@@ -804,18 +974,19 @@ document.getElementById("resetBtn").addEventListener("click", async () => {
   } catch (e) { toast("恢复失败：" + e.message); }
 });
 
-/* ---------- 顶栏全灭开关：打开 = off，关掉 = 回上一个模式 ---------- */
+/* ---------- 顶栏亮灭开关：打到「亮」= 恢复上一个模式，打到「灭」= off ---------- */
 let prevMode = "auto";
-document.getElementById("killSw").addEventListener("change", async e => {
+document.getElementById("swLit").addEventListener("change", async e => {
   if (e.target.checked) {
-    if (current !== "off") prevMode = current;
-    await setMode("off");
-  } else {
     const back = (prevMode && prevMode !== "off") ? prevMode : "auto";
     await setMode(back);
+  } else {
+    if (current !== "off") prevMode = current;
+    await setMode("off");
   }
 });
 
+paintWipe();       // 先按默认值把顶栏胶囊和滑块填好，别等接口回来
 refresh();
 pollFrame();
 setInterval(refresh, 5000);

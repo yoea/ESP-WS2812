@@ -120,6 +120,7 @@ BRIGHTNESS_CAP=128 / setBrightness 50%），host 不再二次打折，否则两�
     python led_host_60.py --autostart status        # 看有没有在跑、什么时候跑的、日志在哪
     python led_host_60.py --autostart stop          # 临时停掉（不卸，下次登录还会起来）
     python led_host_60.py --autostart start         # 立刻启动一次
+    python led_host_60.py --autostart restart       # 重启（自动复用上次后台启动的参数）
     python led_host_60.py --autostart remove        # 彻底卸掉自启
 
 常用参数：
@@ -129,6 +130,8 @@ BRIGHTNESS_CAP=128 / setBrightness 50%），host 不再二次打折，否则两�
     --forget-device          清除绑定（删 device.json）
     --panel-port 51876       控制面板端口（局域网可访问，仅 /esp60led 有效）
     --no-panel               关掉控制面板，只能用 host/idle_state.json 切模式
+    --open-panel             确保服务在跑，并用 Edge 应用窗口（无地址栏/标签页）
+                             打开面板；桌面快捷方式「ESP-WS2812 灯带面板」用的就是它
     --idle-mode auto         空闲模式初值；12 种，见控制面板 / README
     --max-level 0.70         封面呼吸灯珠最大亮度 0~1（默认 0.70）
     --brightness 255         固件侧二次亮度（默认满档，一般不改）
@@ -161,6 +164,7 @@ import json
 import math
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -1553,6 +1557,14 @@ BOOT_QUIET_SEC = 12.0
 # 输出平滑时间常数。只用来让换歌时的颜色柔和过渡，不能太大 —— 否则会把呼吸的振幅削掉：
 # 一阶低通对周期 T 的正弦，振幅保留 1/√(1+(2πτ/T)²)。τ=0.35s 时 4s 呼吸只剩 88%、
 # 2s 呼吸只剩 67%；τ=0.15s 则是 97% / 90%，换歌过渡也还够柔和。
+# 亮灭过渡：每颗间隔多少毫秒。默认 5ms —— 60 颗约 0.3 秒扫完，比原来
+# 50ms（3 秒）利落得多。面板顶栏「过渡」胶囊可以在线调，值存进
+# idle_state.json，重启也保留。
+# 注意渲染是 50Hz（20ms 一帧），间隔小于 20ms 时每帧会一次推进好几颗，
+# 总时长照样按 ms 算，只是颗粒度受帧率限制 —— 想更细腻只能提帧率，不值当。
+WIPE_STEP_DEFAULT_MS = 5.0
+WIPE_STEP_MIN_MS = 0.5       # 0 会让除法趋近无穷，最低给 0.5ms（瞬间全铺）
+WIPE_STEP_MAX_MS = 60.0      # 再慢一颗一颗数着看没必要
 SMOOTH_TAU = 0.15
 
 # WS2812 视觉线性极差，不做 gamma 校正暗部会跳阶
@@ -2266,6 +2278,12 @@ class Monitor:
         self.state = "media"
         self._media_off_since = None        # 音乐断了多久（缓冲计时）
         self.current = [(0, 0, 0)] * LED_COUNT
+        # 亮灭过渡（顶栏 switch）：亮=从第 0 颗逐颗点亮，灭=从尾颗逐颗熄灭，
+        # 每颗间隔 mode.wipe_ms 毫秒（面板可调）。详见 _wipe_track / _wipe_apply。
+        self._wipe = None                 # {"kind": "on"/"off", "t0": 起点时刻}
+        self._wipe_prev_mode = None       # 上一帧的模式：用来发现「亮 ↔ 灭」的边界
+        self._wipe_snap = None            # 熄灯前最后一帧（off 之后 current 立刻清零）
+        self._wipe_snap_raw = False       # 那一帧是不是 PWM 直出域
         # 开机静默期到期时刻（0 = 不启用）。自启时由 main() 传 BOOT_QUIET_SEC，
         # 期间不管什么状态、什么电平都强制全灭，挡住登录音/通知音误触发。
         self._boot_quiet_until = (time.time() + max(0.0, boot_quiet)
@@ -2446,6 +2464,53 @@ class Monitor:
             base = palette_to_leds(self.media.palette)
         return fill_dark_leds(base)
 
+    # ---------- 亮灭切换：整条逐颗点亮 / 逐颗熄灭 ----------
+
+    def _wipe_track(self, mode, now):
+        """发现「亮 ↔ 灭」的边界，起一段逐颗过渡。
+
+        只有 off 与非 off 之间才做过渡；模式之间互切仍走原来的平滑淡入淡出，
+        免得每次换灯效都拖 3 秒。
+        """
+        prev = self._wipe_prev_mode
+        self._wipe_prev_mode = mode
+        if prev is None or mode == prev:
+            return
+        if prev != "off" and mode == "off":
+            # off 一进来 current 立刻清零，先存一份「熄灯前一帧」当退场动画的素材
+            self._wipe_snap = list(self.current)
+            self._wipe_snap_raw = self._raw_frame
+            self._wipe = {"kind": "off", "t0": now}
+        elif prev == "off" and mode != "off":
+            self._wipe = {"kind": "on", "t0": now}
+        else:
+            self._wipe = None
+
+    def _wipe_apply(self, frame, now):
+        """按已过时间裁掉还没轮到 / 已经该灭的灯珠。
+
+        亮：第 0 秒亮第 1 颗，之后每 wipe_ms 毫秒多亮一颗（从头往尾推）。
+        灭：整条先保持熄灯前那一帧，然后每 wipe_ms 毫秒从尾往头少一颗。
+        间隔是热改的（面板可调），所以每次现算，不缓存。
+        """
+        w = self._wipe
+        if not w:
+            return frame
+        step = max(0.0001, float(self.mode.wipe_ms) / 1000.0)
+        steps = int((now - w["t0"]) / step)
+        if w["kind"] == "on":
+            k = steps + 1                      # t=0 就先亮第一颗，不用干等 50ms
+            if k >= LED_COUNT:
+                self._wipe = None
+                return frame
+            return [c if i < k else (0, 0, 0) for i, c in enumerate(frame)]
+        lit = LED_COUNT - steps
+        if lit <= 0:
+            self._wipe = None
+            return [(0, 0, 0)] * LED_COUNT
+        snap = self._wipe_snap or frame
+        return [c if i < lit else (0, 0, 0) for i, c in enumerate(snap)]
+
     def tick(self, strip: LedStrip):
         target = self.compute_target()
         now = time.time()
@@ -2455,6 +2520,9 @@ class Monitor:
             self.mode.poll()
             self._mode_polled = now
         mode = self.mode.current
+        # 亮灭切换要逐颗过渡：必须在下面改 current / _raw_frame 之前判定，
+        # 因为 off 一进来 current 就被清零，得先留一份熄灯前的帧做「退场」动画。
+        self._wipe_track(mode, now)
         decor_on = False
         # GPU 读数：1Hz 采样 -> 每帧插值，快起慢落。不管当前是不是 gpu 模式
         # 都更新，面板卡片上的百分比才不会只在选中时才动。
@@ -2495,11 +2563,15 @@ class Monitor:
         tau = MIC_SMOOTH_TAU if sound_driven else SMOOTH_TAU
         k = 1.0 - math.exp(-FRAME_INTERVAL / tau)
         self.current = [lerp_rgb(c, t, k) for c, t in zip(self.current, target)]
-        strip.set_all(self.current, raw=self._raw_frame)
+        # 亮灭过渡最后一道：把整帧按「已过几颗」切开，剩下的直接压黑。
+        wipe_off = bool(self._wipe and self._wipe["kind"] == "off")
+        frame = self._wipe_apply(self.current, now)
+        raw = self._wipe_snap_raw if wipe_off else self._raw_frame
+        strip.set_all(frame, raw=raw)
         # 给面板的「自动」卡片供实时预览：10Hz 采样一次就够，别每帧做算术。
         # 面板另有 150ms 轮询，两边频率对得上。
         if now - self._live_at >= 0.1:
-            self.mode.live = sample_frame(self.current)
+            self.mode.live = sample_frame(frame)
             self._live_at = now
         # 只有一条 60 颗灯带，主循环直接写串口。
         # 板载 LED 只在事件瞬间发一条脉冲，不参与渲染帧
@@ -2584,6 +2656,8 @@ class Monitor:
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_PATH = os.path.join(BASE_DIR, "logs", "led_host.log")
 PID_PATH = os.path.join(BASE_DIR, "logs", "led_host.pid")
+# 上次后台启动用的完整参数：--autostart restart 靠它原样复活，不用用户再敲一遍
+LAUNCH_PATH = os.path.join(BASE_DIR, "logs", "launch_args.json")
 LOG_MAX_BYTES = 1_000_000        # 日志超过 1MB 就滚成 .old，别无限长
 # ★ 2026-11-09 起本目录（ESP-WS2812）是唯一维护的一份，ESP-01S-LightStrip-60 只作归档。
 # 任务名同步改成 ESP-WS2812，与已删除的旧任务区分开，且与旧 8 颗脚本的任务名不冲突。
@@ -2647,6 +2721,33 @@ def setup_background():
     sys.stdout = _Timestamped(f)
     sys.stderr = sys.stdout
     print(f"--- 后台启动 ---  {' '.join(sys.argv)}")
+    _save_launch_args(sys.argv[1:])
+
+
+def _save_launch_args(argv):
+    """把本次后台启动的参数存下来，供 --autostart restart 原样复活。
+
+    只记 sys.argv[1:]（含 --background / --wait-port），重启时直接拼回命令行，
+    用户自定义过的 --brightness / --max-level 之类不会在重启后悄悄退回默认值。
+    """
+    try:
+        os.makedirs(os.path.dirname(LAUNCH_PATH), exist_ok=True)
+        with open(LAUNCH_PATH, "w", encoding="utf-8") as f:
+            json.dump({"argv": list(argv),
+                       "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")},
+                      f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+def _load_launch_args():
+    """读回上次后台启动的参数；没有 / 坏了就返回 None，调用方退回默认值"""
+    try:
+        with open(LAUNCH_PATH, "r", encoding="utf-8") as f:
+            argv = json.load(f).get("argv")
+        return [str(a) for a in argv] if isinstance(argv, list) and argv else None
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 def _record_pid():
@@ -2814,6 +2915,7 @@ def _print_installed(how, task=True):
     print(f"  日志  ：{LOG_PATH}")
     print("  立刻跑：python led_host_60.py --autostart start")
     print("  临时停：python led_host_60.py --autostart stop")
+    print("  重  启：python led_host_60.py --autostart restart")
     print("  彻底卸：python led_host_60.py --autostart remove")
 
 
@@ -2985,31 +3087,108 @@ def autostart_stop():
     return 0
 
 
+def _background_argv(args):
+    """把当前命令行的运行参数拼成后台进程的 argv（不含解释器与脚本路径）"""
+    wait = args.wait_port if args.wait_port > 0 else DEFAULT_WAIT_PORT
+    return ["--background", "--wait-port", f"{wait:g}"] + _runtime_args(args)
+
+
+def _launch_detached(extra_args):
+    """起一个后台 pythonw 进程，参数原样透传（extra_args 里通常含 --background）"""
+    _spawn_detached([_pythonw(), os.path.abspath(__file__)] + list(extra_args),
+                    cwd=BASE_DIR)
+
+
+def _port_listening(port):
+    """面板端口上有没有人在监听（不看是不是自己人，只看端口通不通）"""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def _wait_until(cond, timeout, interval=0.3):
+    deadline = time.time() + max(0.0, timeout)
+    while time.time() < deadline:
+        if cond():
+            return True
+        time.sleep(interval)
+    return cond()
+
+
+def _tail_log(lines=10):
+    try:
+        with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+            tail = f.readlines()[-lines:]
+    except OSError:
+        return
+    print("  ---- 日志最后几行 ----")
+    for line in tail:
+        print("  " + line.rstrip())
+
+
 def autostart_start():
     # 已经在跑就别再起一个：两个实例会抢串口，先连上的那个会一直被踢下线
     if _panel_is_ours(PANEL_PORT):
         print("  已经在运行（面板端口有响应），不用重复启动。"
-              "要重启先 --autostart stop。")
+              "要重启直接用 --autostart restart。")
         return 0
     rc, out, err = _schtasks(["/run", "/tn", TASK_NAME])
     if rc == 0:
         print("  已让计划任务立刻启动一次（几秒后看 --autostart status 确认）。")
         return 0
     print("  计划任务没注册，直接后台启动一次：")
-    pyw = _pythonw()
-    argv = [pyw, os.path.abspath(__file__), "--background",
-            "--wait-port", f"{DEFAULT_WAIT_PORT:g}"]
-    # 被作业对象（job）管着的环境里，普通子进程会随调用方退出一起被回收 ——
-    # 先试「脱离作业对象」标志；不允许（WinError 5）就退回普通方式。
-    base_flags = 0x00000008 | 0x00000200 if os.name == "nt" else 0   # DETACHED|NEW_GROUP
-    try:
-        subprocess.Popen(argv, cwd=BASE_DIR, close_fds=True,
-                         creationflags=base_flags | 0x01000000)     # BREAKAWAY_FROM_JOB
-    except OSError:
-        subprocess.Popen(argv, cwd=BASE_DIR, close_fds=True,
-                         creationflags=base_flags)
+    _launch_detached(["--background", "--wait-port", f"{DEFAULT_WAIT_PORT:g}"])
     print("  已启动。要开机也自动跑，先跑 --autostart install。")
     return 0
+
+
+def _restart_has_flags():
+    """本次命令行除了 --autostart restart 之外还带别的参数吗"""
+    rest = [a for a in sys.argv[1:] if a not in ("--autostart", "restart")]
+    return bool(rest)
+
+
+def autostart_restart(args):
+    """停 → 等串口/端口释放 → 用上次的参数重新起 → 确认面板回来。
+
+    与「stop 再 start」的区别：
+      - 会等端口真的空出来（旧进程退出有延迟，立刻起会被单实例检查挡回去）；
+      - 默认复用上次后台启动的完整参数（logs/launch_args.json），
+        用户自定义的 --brightness / --max-level 不会在重启后退回默认值；
+      - 起完会轮询 /api/status 确认真的活了，失败直接把日志尾巴打出来。
+    """
+    print("正在重启后台灯带服务…")
+    print("① 停掉当前进程")
+    autostart_stop()
+    if not _wait_until(lambda: not _port_listening(PANEL_PORT), 10.0):
+        print(f"  端口 {PANEL_PORT} 一直被占用，可能有别的程序在用它；先手动处理再重试。")
+        return 1
+    # 串口要等旧进程彻底退出才放开，否则新进程一开就 PermissionError 然后退避重连
+    time.sleep(1.2)
+
+    if _restart_has_flags():
+        extra, source = _background_argv(args), "本次命令行"
+    else:
+        saved = _load_launch_args()
+        extra = saved or _background_argv(args)
+        source = "上次启动参数" if saved else "默认参数"
+
+    print(f"② 重新启动（{source}）")
+    try:
+        _launch_detached(extra)
+    except OSError as e:
+        print(f"✗ 启动失败：{e}")
+        return 1
+
+    if _wait_until(lambda: _panel_is_ours(PANEL_PORT), 30.0, 0.5):
+        print("✓ 重启完成，面板已恢复：http://127.0.0.1:%d/%s" % (PANEL_PORT, PANEL_SECRET))
+        return 0
+    print("✗ 新进程没起来（等了 30 秒没等到面板响应）。")
+    _tail_log()
+    print("  排查：python led_host_60.py --autostart status")
+    return 1
 
 
 def autostart_remove():
@@ -3031,7 +3210,141 @@ def autostart_dispatch(args):
         return autostart_status()
     if args.autostart == "start":
         return autostart_start()
+    if args.autostart == "restart":
+        return autostart_restart(args)
     return autostart_stop()
+
+
+# ============================================================
+# 桌面面板窗口（--open-panel）：把网页当成本地小应用打开
+# ============================================================
+EDGE_PATHS = (
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+)
+PANEL_WINDOW_SIZE = "1120,800"
+
+
+def _quiet_streams():
+    """pythonw（双击 .lnk 走的解释器）没有控制台，sys.stdout/stderr 是 None，
+    此时 print 会直接抛 AttributeError。把输出接到日志：既能照常 print，
+    也留下排查记录。从终端手动跑（有 stdout）时保持原样，不抢终端。"""
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    try:
+        f = open(LOG_PATH, "a", encoding="utf-8")
+    except OSError:
+        f = open(os.devnull, "w", encoding="utf-8")
+    sys.stdout = _Timestamped(f)
+    sys.stderr = sys.stdout
+
+
+def _find_edge():
+    """定位 msedge.exe：先查注册表 App Paths（装在非默认目录也认），
+    再退回常见安装路径；都没有返回 None，调用方转默认浏览器。"""
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+        sub = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe"
+        for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            try:
+                with winreg.OpenKey(root, sub) as k:
+                    exe = winreg.QueryValueEx(k, "")[0]
+            except OSError:
+                continue
+            if exe and os.path.exists(exe):
+                return exe
+    except Exception:
+        pass
+    for exe in EDGE_PATHS:
+        if os.path.exists(exe):
+            return exe
+    return None
+
+
+def _toast(text, title="ESP-WS2812 灯带面板"):
+    """无控制台时唯一还能把话说给用户听的方式（不弹窗就彻底静默失败）"""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(None, text, title, 0x00000040)
+    except Exception:
+        pass
+
+
+def _spawn_detached(argv, cwd=None):
+    """起一个和本进程脱钩的子进程。
+
+    「脱钩」是硬需求：被作业对象（job）管着时（IDE / 终端 / 自动化工具启动的
+    本进程），普通 Popen 出的子进程会随调用方退出一起被回收 —— 表现为窗口一闪
+    就没了。先试 BREAKAWAY_FROM_JOB，不允许（WinError 5）就退回普通方式。
+    """
+    flags = 0x00000008 | 0x00000200 if os.name == "nt" else 0   # DETACHED|NEW_GROUP
+    try:
+        subprocess.Popen(argv, cwd=cwd, close_fds=True,
+                         creationflags=flags | 0x01000000)
+    except OSError:
+        subprocess.Popen(argv, cwd=cwd, close_fds=True, creationflags=flags)
+
+
+def open_panel_window(args):
+    """确保后台服务在跑，再用 Edge 的「应用窗口」打开控制面板。
+
+    应用窗口 = 没有地址栏 / 标签页 / 工具栏，只剩一条系统标题栏，任务栏独立
+    图标，Alt+Tab 独立条目。与 Edge「安装此站点为应用」出来的窗口外观一致，
+    但**不要求 HTTPS**：PWA 安装属于安全上下文的特权，http://<内网IP> 给不了，
+    而 --app 命令行开关没有任何安全上下文限制，内网明文地址照样能用。
+
+    地址走回环 127.0.0.1：不经过网卡、不受防火墙放行状态和本机 IP 变动影响，
+    加载也最快。手机端照旧用 http://<本机IP>:端口/esp60led。
+    """
+    _quiet_streams()
+    port = args.panel_port
+    url = f"http://127.0.0.1:{port}/{PANEL_SECRET}"
+    slow = False
+
+    if _panel_is_ours(port):
+        print(f"面板已在运行，直接开窗：{url}")
+    else:
+        print("面板没在跑，先拉起后台服务…")
+        # 复用上次后台启动的完整参数，别把用户调过的 --brightness / --max-level 丢掉
+        extra = _load_launch_args() or [
+            "--background", "--wait-port", f"{DEFAULT_WAIT_PORT:g}"]
+        try:
+            _launch_detached(extra)
+        except OSError as e:
+            print(f"✗ 启动失败：{e}")
+            _toast(f"后台灯带服务启动失败：{e}\n\n日志：\n{LOG_PATH}")
+            return 1
+        # 面板在串口之前就起来了，通常 1~2 秒应答；20 秒是给冷启动/杀软扫描的余量
+        if _wait_until(lambda: _panel_is_ours(port), 20.0, 0.4):
+            print("✓ 服务已就绪")
+        else:
+            slow = True
+            print("! 20 秒内面板没应答，仍尝试开窗（可能显示「无法访问」）")
+
+    edge = _find_edge()
+    if edge:
+        try:
+            _spawn_detached([edge, f"--app={url}",
+                             f"--window-size={PANEL_WINDOW_SIZE}"])
+            print(f"已用 Edge 应用窗口打开：{url}")
+        except OSError as e:
+            print(f"Edge 启动失败（{e}），改用默认浏览器")
+            edge = None
+    if not edge:
+        import webbrowser
+        webbrowser.open(url)
+        print(f"已用默认浏览器打开：{url}")
+
+    # 放在开窗之后：MessageBox 会一直阻塞到点「确定」，不能挡住开窗
+    if slow:
+        _toast("面板启动较慢或失败。窗口里若显示「无法访问」，\n"
+               "请看日志排查：\n" + LOG_PATH)
+    return 0
 
 
 # ============================================================
@@ -3281,10 +3594,15 @@ GPU_RELEASE_TAU = 0.60           # 慢落，避免读数掉一格时灯珠整片
 # 颗数分段（用户指定）：0~10% 用 0→11 颗、10~90% 用 11→49 颗、
 # 90~100% 用 49→60 颗。两端各 11 颗是精细档位，中间 38 颗铺 80% 的区间。
 GPU_COUNT_STOPS = ((0.00, 0.0), (0.10, 11.0), (0.90, 49.0), (1.00, 60.0))
-# 色相：绿 120° → 黄 60° → 橙 30° → 红 0° → 紫红 -40°(即 320°)。
-# 0~10% 锁在绿色，低占用不会一上来就变黄；35% 转黄、60% 转橙、85% 转红。
-GPU_HUE_STOPS = ((0.00, 120.0), (0.10, 120.0), (0.35, 60.0),
-                 (0.60, 30.0), (0.85, 0.0), (1.00, -40.0))
+# 颜色（用户指定）：沿色环从绿 120° 一路降到红 0°，中间**连续**经过
+# 黄 60°、橙 30° —— 这一段里没有青(180°)、蓝(240°)、紫(300°)，所以每两颗
+# 之间都是平滑过渡，不会出现跳色。只在这段上做色相插值，饱和度和亮度
+# 全程保持 1.0，颜色始终是纯色相，不会发灰。
+# 0~10% 是「精细档」（11 颗灯占 10% 量程），色相只从 120° 微移到 110°，
+# 低占用仍然以绿色为主；45% 到黄、70% 到橙、**95% 就到纯红并保持到 100%**
+# （用户要求红色要有足够宽度，90~100% 那 11 颗精细灯是整段红尾巴）。
+GPU_HUE_STOPS = ((0.00, 120.0), (0.10, 110.0), (0.45, 60.0),
+                 (0.70, 30.0), (0.95, 0.0), (1.00, 0.0))
 
 PDH_FMT_DOUBLE = 0x00000200
 PDH_MORE_DATA = 0x800007D2       # buffer 传 NULL 时的正常返回，不是错误
@@ -3466,30 +3784,49 @@ def gpu_led_count(load):
     return _gpu_piecewise(load, GPU_COUNT_STOPS)
 
 
-def gpu_hue(load):
-    """占用 0~1 -> 色相角度（可能为负，hsv_to_rgb 内部取模）。"""
-    return _gpu_piecewise(load, GPU_HUE_STOPS) % 360.0
+def gpu_color(load):
+    """占用 0~1 -> (r, g, b)：色环 120°→0° 的连续渐变（绿→黄→橙→红）"""
+    return hsv_to_rgb(_gpu_piecewise(load, GPU_HUE_STOPS), 1.0, 1.0)
+
+
+def gpu_load_at_count(k):
+    """亮 k 颗 -> 对应的占用率阈值（gpu_led_count 的分段反函数）。
+
+    用于把「第几颗」换算回「它是多少占用率点亮的那一颗」，颜色就跟着这个
+    阈值定死 —— 每颗灯的颜色只跟位置有关，不随当前读数变色。
+    """
+    stops = GPU_COUNT_STOPS
+    for (x0, y0), (x1, y1) in zip(stops, stops[1:]):
+        if k <= y1:
+            if y1 <= y0:
+                return x1
+            return x0 + (x1 - x0) * (k - y0) / (y1 - y0)
+    return 1.0
 
 
 def gpu_frame(load, n=LED_COUNT, level=1.0):
     """占用 0~1 -> n 颗 RGB（调用方 raw 直出）。
 
-    已亮的灯珠**同一个色相**：颜色 = 精确读数，颗数 = 分段档位，
-    下一颗拿小数部分当亮度系数渐入，视觉上是连续推进而不是跳一格。
+    ★ 整条是**固定渐变**：每颗灯代表一个占用率阈值，颜色由该阈值查
+    GPU_HUE_STOPS 得到（绿→黄→橙→红），从头到尾不随当前读数改变。所以 95%
+    的时候看到的是从绿到红的一整道渐变，而不是整条糊成一个红。颗数 = 分段档位，
+    下一颗拿小数部分当亮度系数渐入。
     """
     lv = _clamp01(level)
     if load <= 0.0 or lv <= 0.0:
         return [(0, 0, 0)] * n
-    col = tuple(int(round(c * lv)) for c in hsv_to_rgb(gpu_hue(load), 1.0, 1.0))
     want = gpu_led_count(load) * (n / float(LED_COUNT))   # 预览颗数不同也能用
     whole = int(want)
     frac = want - whole
-    if whole >= n:
-        return [col] * n
-    out = [(0, 0, 0)] * n
-    for i in range(whole + (1 if frac > 1e-6 else 0)):
-        k = frac if i == whole else 1.0
-        out[i] = tuple(int(round(c * k)) for c in col)
+    scale = LED_COUNT / float(n)                          # 预览一颗 = 实际几颗
+    out = []
+    for i in range(n):
+        if i > whole or (i == whole and frac <= 1e-6):
+            out.append((0, 0, 0))
+            continue
+        col = gpu_color(gpu_load_at_count((i + 0.5) * scale))
+        k = (frac if i == whole else 1.0) * lv
+        out.append(tuple(0 if c <= 0 else min(255, int(round(c * k))) for c in col))
     return out
 # 所有装饰模式的默认整体强度：会整条全亮的模式（纯色/渐变/跑马灯/彩虹/呼吸）
 # 默认只发 50%，避免 host 上限放开后一上来就吃满 1.8A。用户可在面板拖到
@@ -3683,6 +4020,7 @@ class ModeController:
         self.live = None             # 当前实际帧的 14 段采样，供 auto 卡片实时预览
         self.colors = {}             # {mode: {"hex": "#RRGGBB"}}，只存改过的
         self.levels = {}             # {mode: 0.1~1.0}，只存改过的
+        self.wipe_ms = WIPE_STEP_DEFAULT_MS   # 亮灭过渡每颗间隔（毫秒）
         # 串口链路状态（HTTP 线程读 / 主循环写，整体替换引用，无锁）
         self.link = {"state": "up", "port": "", "error": "", "since": "",
                      "attempts": 0, "next_delay": 0, "history": [],
@@ -3776,6 +4114,15 @@ class ModeController:
                 out[k] = round(max(0.1, min(1.0, lv)), 3)
         return out
 
+    @staticmethod
+    def _parse_wipe_ms(raw):
+        """亮灭过渡间隔，非法值一律回默认；0.5~60ms 之外夹到边界。"""
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            return WIPE_STEP_DEFAULT_MS
+        return round(max(WIPE_STEP_MIN_MS, min(WIPE_STEP_MAX_MS, v)), 2)
+
     def _migrate(self):
         """旧的 txt + 扁平 JSON 合成本文件，只在第一次运行时做一次。"""
         if os.path.exists(self.path):
@@ -3828,6 +4175,7 @@ class ModeController:
                             and k not in levels):
                         levels.update(self._parse_levels({k: v["level"]}))
             self.levels = levels
+            self.wipe_ms = self._parse_wipe_ms(data.get("wipeMs"))
         try:
             self._mtime = os.path.getmtime(self.path)
         except OSError:
@@ -3849,7 +4197,7 @@ class ModeController:
         try:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump({"mode": self.current, "colors": self.colors,
-                           "levels": self.levels},
+                           "levels": self.levels, "wipeMs": self.wipe_ms},
                           f, ensure_ascii=False, indent=2)
             os.replace(tmp, self.path)
             self._mtime = os.path.getmtime(self.path)
@@ -3914,6 +4262,13 @@ class ModeController:
             rgb = _hex_to_rgb(IDLE_DEFAULT_COLORS.get(mode, "#FFFFFF"))
         return rgb, self.level_of(mode)
 
+    def set_wipe_ms(self, value):
+        """改亮灭过渡间隔（毫秒）。下一帧渲染立刻按新值算，不用重启。"""
+        ms = self._parse_wipe_ms(value)
+        self.wipe_ms = ms
+        self._write()
+        return ms
+
     def set_color(self, mode, hex_value):
         mode = str(mode).strip().lower()
         if mode not in IDLE_COLOR_MODES or _hex_to_rgb(hex_value) is None:
@@ -3962,6 +4317,28 @@ def _panel_html_bytes():
             return f.read().encode("utf-8")
     except Exception as e:
         return (f"<h1>panel.html 读取失败</h1><p>{e}</p>").encode("utf-8")
+
+
+# 可以被根路径直接取到的静态资源（白名单，其它根路径仍然 404）。
+# 浏览器和 Windows 桌面快捷方式都硬编码请求 /favicon.ico，不带 /esp60led 前缀，
+# 所以这张表里的名字在面板里会同时按「/名字」和「/esp60led/名字」两条路径放行。
+STATIC_ASSETS = {
+    "favicon.ico": "image/x-icon",
+    "favicon.svg": "image/svg+xml",
+    "apple-touch-icon.png": "image/png",
+    "favicon-256.png": "image/png",
+}
+
+
+def _read_asset(name):
+    """按名字读 host/ 目录下的静态资源，读不到返回 None（调用方回 404）。"""
+    if name not in STATIC_ASSETS:      # 挡住 ../ 之类的路径穿越
+        return None
+    try:
+        with open(os.path.join(BASE_DIR, name), "rb") as f:
+            return f.read()
+    except OSError:
+        return None
 
 
 def _panel_commit():
@@ -4018,6 +4395,34 @@ def _panel_is_ours(port=PANEL_PORT, timeout=1.5):
     return isinstance(data, dict) and "link" in data and "modes" in data
 
 
+def _link_state(link):
+    """取串口链路状态，缺失时按 up —— 正常运行时 controller.link 一定存在，
+    None 只可能出现在极短的初始化窗口里，那时候报「在线」比报「坏了」更少误报。"""
+    return str((link or {}).get("state") or "up")
+
+
+def com_headers(link):
+    """把串口状态塞进响应头，监控端不拉页面也能判断在线与否。
+
+    值全部是内部生成的 ASCII（COM3 / D1MINI-LED60 / 11-09 22:31:10），
+    不会带出中文，也就不需要额外编码。
+    """
+    link = link or {}
+    state = _link_state(link)
+    out = [("X-Led-Com-State", state),
+           ("X-Led-Link", "1" if state == "up" else "0")]
+    if link.get("port"):
+        out.append(("X-Led-Com-Port", str(link["port"])))
+    dev = link.get("device") or {}
+    if dev.get("model") and not dev.get("legacy"):
+        out.append(("X-Led-Com-Device", str(dev["model"])))
+    if state != "up":
+        out.append(("X-Led-Com-Attempts", str(link.get("attempts") or 0)))
+        if link.get("since"):
+            out.append(("X-Led-Com-Since", str(link["since"])))
+    return out
+
+
 def start_panel(controller, port=PANEL_PORT, log=print):
     """进程内 HTTP 面板，绑 0.0.0.0 供局域网访问。
 
@@ -4036,27 +4441,80 @@ def start_panel(controller, port=PANEL_PORT, log=print):
         def log_message(self, fmt, *args):
             pass                     # 后台别刷访问日志
 
-        def _send(self, code, body, ctype="text/plain; charset=utf-8"):
+        def _send(self, code, body, ctype="text/plain; charset=utf-8", extra=None):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            # 所有响应都带上串口状态头（X-Led-Com-*），任何一条请求都能顺带看到
+            for k, v in (extra if extra is not None else self._com_extra()):
+                self.send_header(k, v)
             self.end_headers()
             try:
                 self.wfile.write(body)
             except Exception:
                 pass
 
+        def _com_extra(self):
+            return com_headers(controller.link)
+
         def _404(self):
             self._send(404, b"404 Not Found")
+
+        def _try_asset(self, p, with_body=True):
+            """图标等静态资源的例外分支，返回 True 表示已经应答。
+
+            `/favicon.ico` 是浏览器和 Windows 桌面快捷方式**硬编码**去根路径取的，
+            不带 /esp60led 前缀。所以这几个文件名必须在下面的鉴权检查之前放行，
+            否则快捷方式永远只能拿到默认的空白图标。
+            放行的只有下面这张白名单里的文件，其它根路径照旧 404。
+            """
+            name = p.lstrip("/")
+            if name.startswith(PANEL_SECRET + "/"):
+                name = name[len(PANEL_SECRET) + 1:]
+            ctype = STATIC_ASSETS.get(name)
+            if not ctype:
+                return False
+            data = _read_asset(name)
+            if data is None:
+                self._404()
+                return True
+            self._send(200, data if with_body else b"", ctype)
+            return True
+
+        def do_HEAD(self):
+            """只回头、不回体：`curl -I` 一次就知道串口在不在线，不用下整页。
+
+            **一律 200**（用户要求：串口断开也不能让任何请求失败）。
+            串口状态看响应头 X-Led-Com-State / X-Led-Link。
+            """
+            u = urlparse(self.path)
+            p = u.path.rstrip("/") or "/"
+            if self._try_asset(p, with_body=False):
+                return
+            if p != prefix and not p.startswith(prefix + "/"):
+                return self._404()
+            # HEAD 的 Content-Length 严格说该等于 GET 的长度，但这里只为探测，
+            # 回 0 最简单，也省得为了算长度去把整个页面读一遍。
+            self._send(200, b"", "text/plain; charset=utf-8", self._com_extra())
 
         def do_GET(self):
             u = urlparse(self.path)
             p = u.path.rstrip("/") or "/"
+            if self._try_asset(p):
+                return
             if p != prefix and not p.startswith(prefix + "/"):
                 return self._404()
             if p == prefix:
+                # 页面永远 200（否则串口一断浏览器就打不开面板了），
+                # 串口状态放在响应头里，见 X-Led-Com-*。
                 return self._send(200, _panel_html_bytes(), "text/html; charset=utf-8")
+            if p == prefix + "/api/ping":
+                # 最轻的在线探测：不拉页面、不查模式，只看串口。
+                # **一律 200**，正文直接是状态词（up/retry/down），
+                # 监控端要么看正文、要么看 X-Led-Com-State 头。
+                return self._send(200, _link_state(controller.link).encode(),
+                                  "text/plain; charset=utf-8")
             if p == prefix + "/api/status":
                 data = json.dumps({
                     "mode": controller.current,
@@ -4071,6 +4529,7 @@ def start_panel(controller, port=PANEL_PORT, log=print):
                     "levels": controller.levels,
                     "defaultLevel": IDLE_DEFAULT_LEVEL,
                     "gpu": controller.gpu_status(),
+                    "wipeMs": controller.wipe_ms,
                     "link": controller.link,
                     "panel": controller.panel,
                     "version": {"commit": panel_commit,
@@ -4094,6 +4553,13 @@ def start_panel(controller, port=PANEL_PORT, log=print):
                                   ensure_ascii=False).encode("utf-8")
                 return self._send(200 if ok else 400, data,
                                   "application/json; charset=utf-8")
+            if p == prefix + "/api/wipe":
+                # 亮灭逐颗过渡的间隔（毫秒），改完立刻生效
+                raw = (parse_qs(u.query).get("ms") or [""])[0]
+                ms = controller.set_wipe_ms(raw)
+                data = json.dumps({"ok": True, "wipeMs": ms},
+                                  ensure_ascii=False).encode("utf-8")
+                return self._send(200, data, "application/json; charset=utf-8")
             if p == prefix + "/api/setcolor":
                 q = parse_qs(u.query)
                 mode = (q.get("mode") or [""])[0].strip().lower()
@@ -4497,6 +4963,9 @@ def main():
                          "绑 0.0.0.0 供局域网访问")
     ap.add_argument("--no-panel", action="store_true",
                     help="不启动 HTTP 控制面板，只靠 host/idle_state.json 切换模式")
+    ap.add_argument("--open-panel", action="store_true",
+                    help="确保后台服务在跑，并用 Edge 应用窗口（无地址栏/标签页）"
+                         "打开控制面板；桌面快捷方式用的就是它")
     ap.add_argument("--idle-mode", default="auto", choices=list(IDLE_MODE_NAMES),
                     help="空闲模式初值（默认 auto）；idle_state.json 存在时以文件为准")
     ap.add_argument("--baud", type=int, default=115200)
@@ -4540,10 +5009,11 @@ def main():
     ap.add_argument("--wait-port", type=float, default=0.0, metavar="SEC",
                     help="串口没就绪时最多等几秒（默认 0 不等；自启时装成 %g 秒）"
                          % DEFAULT_WAIT_PORT)
-    ap.add_argument("--autostart", choices=["install", "remove", "status", "start", "stop"],
+    ap.add_argument("--autostart",
+                    choices=["install", "remove", "status", "start", "stop", "restart"],
                     metavar="WHAT",
                     help="开机自启管理：install 装 / remove 卸 / status 看状态 / "
-                         "start 立刻跑 / stop 临时停")
+                         "start 立刻跑 / stop 临时停 / restart 重启（自动复用上次参数）")
     ap.add_argument("--method", choices=["task", "startup"], default="task",
                     help="install 用的方式：task=任务计划程序（默认，需管理员一次）/"
                          "startup=启动文件夹（无需管理员）")
@@ -4579,6 +5049,9 @@ def main():
 
     if args.autostart:
         return autostart_dispatch(args)
+
+    if args.open_panel:
+        return open_panel_window(args)
 
     if args.list_ports:
         print("当前串口：")

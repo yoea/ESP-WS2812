@@ -48,7 +48,7 @@
 |---|---|---|---|
 | 0x01 | SET_ALL | 180B | 60 颗逐颗，第 i 颗 = `payload[i*3..i*3+2]` |
 | 0x03 | BRIGHTNESS | 1B | 0-255，**固件 clamp 到 128（50% 硬限）**；会先 `clear()` 再 `show()`，绝不点亮旧数据 |
-| 0x04 | HEARTBEAT | 0B | 3 秒无帧则渐灭 / 板载灯呼吸失联提示 |
+| 0x04 | HEARTBEAT | 0B | 3 秒无帧则 1 秒内逐颗灭掉（尾→头）/ 板载灯呼吸失联提示 |
 | 0x06 | OFF | 0B | 清灯珠数据 + 亮度归零 + 板载灯灭，停心跳也不报警 |
 | 0x07 | STATUS_LED | 1B | 板载灯 0=灭 1=常亮 2=慢闪 |
 | 0x08 | STATUS_PULSE | 1B | 板载灯短闪几下（事件提示） |
@@ -91,10 +91,56 @@ cd "D:\Develope\esp8266\3.WeMOS D1 mini\ESP-WS2812\host"
 python led_host_60.py --diagnose
 python led_host_60.py                       :: 前台运行，Ctrl+C 退出
 python led_host_60.py --autostart install   :: 唯一自启任务「ESP-WS2812 60颗音乐灯带」
+python led_host_60.py --autostart restart   :: 重启（自动复用上次后台参数，改完代码用它）
 ```
+
+**`--autostart restart` 做了什么**：结束旧进程 → 等面板端口真的空出来 → 串口释放 →
+按 `host/logs/launch_args.json`（每次后台启动都会写）里的完整参数原样重新拉起来 →
+轮询 `/api/status` 确认面板真的活了，失败时直接打日志尾巴。所以重启后
+`--brightness` / `--max-level` 这些自定义值不会退回默认。若在命令行里另带了参数，
+则以本次参数为准。
 
 **控制面板**：`http://<本机IP>:51876/esp60led`（13 种空闲模式，含 GPU 监控；全灭是顶栏小开关），
 见「空闲模式控制面板」。`--panel-port` 改端口、`--no-panel` 关面板。
+
+顶栏「过渡」胶囊可在线调**亮灭逐颗过渡的间隔**（默认 5ms，60 颗约 0.3 秒扫完；
+范围 0.5~60ms，滑块是对数刻度）。改动立即生效并写进 `host/idle_state.json`
+的 `wipeMs`，重启后保留。
+
+### 串口在线探测（不拉页面）
+
+监控脚本 / 快捷指令不用下载整个 HTML 也能判断灯带在不在线：
+
+```bat
+:: 只回头、不回体：不管串口在不在线都是 200，状态看 X-Led-Com-* 头
+curl -I http://<本机IP>:51876/esp60led
+
+:: 最轻的探测：body 只有 up / retry / down 几个字节
+curl -i http://<本机IP>:51876/esp60led/api/ping
+```
+
+**所有响应**（含页面、任何 `/api/*`、404）都带这几个头：
+
+| 响应头 | 说明 |
+|---|---|
+| `X-Led-Com-State` | `up` / `retry`（断开重连中）/ `down`（已放弃重连） |
+| `X-Led-Link` | 简化值：`1` 在线、`0` 不在线 |
+| `X-Led-Com-Port` | 当前串口，如 `COM3`（不知道时不发） |
+| `X-Led-Com-Device` | 设备型号，如 `D1MINI-LED60`（未烧 v6 固件时不发） |
+| `X-Led-Com-Attempts` | 已重试次数（仅断开时发） |
+| `X-Led-Com-Since` | 断开的起始时间（仅断开时发） |
+
+⚠️ **所有请求永远返回 200**（页面、`HEAD`、`/api/ping`、任何 `/api/*` 都一样）。
+串口断开时也绝不返回 5xx——否则浏览器只会显示错误页，而那个页面正是用来看
+「为什么断、重连到第几次」的。**在线与否只看响应头或 ping 的正文**：
+
+```bat
+:: 看头（-s -o NUL 丢掉页面，只看 X-Led-Link）
+curl -s -o NUL -D - http://<本机IP>:51876/esp60led | findstr X-Led-Link
+
+:: 或看正文
+curl -s http://<本机IP>:51876/esp60led/api/ping
+```
 
 ### 串口自动识别（固件身份证 + 序列号绑定）
 
@@ -306,7 +352,7 @@ powershell -ExecutionPolicy Bypass -File "D:\Develope\esp8266\3.WeMOS D1 mini\ES
 
 | 阶段 | 旧行为 |
 |---|---|
-| 关机 | OFF 没发出；固件 3 秒后只把 `currentLevel` 渐灭到 0，**颜色数据没清** |
+| 关机 | OFF 没发出；固件 3 秒后 1 秒内逐颗灭掉（尾→头），像素已被清成 0 |
 | 开机空窗 | `LogonTrigger` 延迟 20s + `--wait-port`（上限 30s，握手成功即返回），期间无人管灯带 |
 | 第一条帧 | `CMD_BRIGHTNESS` 恢复亮度并 `show()`，把关机前那一帧**原样复活** → 「中间亮一颗」 |
 | 登录音效 | ambient 检测到输出峰值，按电平亮起 1 颗（不是残留，但看着一样莫名） |
@@ -456,6 +502,37 @@ Web 最终一定能打开 —— 否则连串口错误都看不到。
 只在 `current === "auto"` 时启用，其它 11 张卡片的固定演示预览与灯珠数量都不变。
 页面隐藏（`document.hidden`）时暂停轮询，省移动端流量；模式列表仍每 5 秒同步一次，
 外部改了模式也能看到。
+
+### 当成桌面应用打开（无地址栏）
+
+桌面上有「**ESP-WS2812 灯带面板**」快捷方式（`.lnk`，图标就是面板的灯带 favicon），
+双击 = 直接弹出一个**没有地址栏 / 标签页 / 工具栏**的窗口，只剩一条系统标题栏，
+任务栏独立图标、Alt+Tab 独立条目 —— 和 Edge「安装此站点为应用」出来的窗口一个样。
+
+实现是 `pythonw led_host_60.py --open-panel`（快捷方式的目标就是它，所以不会闪黑窗）：
+
+1. 先用 `/api/status` 探本机 51876：**服务在跑就直接开窗**（约 1 秒）；
+2. 没在跑就按 `logs/launch_args.json` 里上次的完整参数后台拉起（与
+   `--autostart restart` 同一套 `_launch_detached`），轮询到面板应答（≤20s）再开窗；
+3. 窗口用 `msedge.exe --app=... --window-size=1120,800` 打开。
+
+**为什么不用 PWA「安装为应用」**：那条路要求安全上下文（HTTPS 或 localhost），
+面板平时是 `http://<内网IP>:51876`，Edge 会拒绝注册 Service Worker，安装入口根本
+不出现。`--app` 是命令行开关，没有任何安全上下文限制，内网明文地址照样能开。
+
+**开窗地址用回环 `http://127.0.0.1:51876/esp60led`**：不经过网卡、不受防火墙
+放行状态和本机 IP 变动影响，也不走系统代理，加载最快。手机 / 平板照旧用
+`http://<本机IP>:51876/esp60led`，两条路径是同一个服务。
+
+几个行为细节：
+
+- **关窗口不关服务**：窗口只是浏览器，host 进程独立跑着，灯效和手机访问都不受影响；
+  想彻底停服务用 `--autostart stop`。
+- 找不到 Edge（注册表 `App Paths\msedge.exe` 和两个常见安装路径都没有）时，
+  退回默认浏览器；启动超时会弹一个提示框指到日志（pythonw 没有控制台，
+  不弹框就等于静默失败）。
+- 开窗进程必须**脱离作业对象**（`BREAKAWAY_FROM_JOB`）：从 IDE / 终端 / 自动化
+  工具启动时，普通子进程会随调用方退出被回收，表现是窗口一闪就没。
 
 ### 机制与三种语义
 

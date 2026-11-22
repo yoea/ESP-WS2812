@@ -42,11 +42,13 @@
  *   状态切换  闪 3 下（0x08 payload=3）
  * 脉冲结束自动回到熄灭，其余时间全灭。
  *
- * 主机失联时转成「温柔呼吸」，用 PWM 渐亮渐暗：
- *   超过 HEARTBEAT_TIMEOUT 没收到任何帧，且主机最后一条不是 OFF -> 呼吸
+ * 主机失联时灯带自己收尾（fail-safe）：
+ *   超过 HEARTBEAT_TIMEOUT(3s) 没收到任何帧，且主机最后一条不是 OFF
+ *   -> 1 秒内从尾颗往头逐颗灭掉（WIPE_OFF_MS/60 = 16ms 一颗），
+ *     观感和网页上点「灭」开关完全一样。灭完板载 LED 转 PWM 呼吸报警。
  *   主机主动退出会先发 OFF，这时保持熄灭 —— 手动关掉不误报。
  *   上电后主机一直没连上，同样会进入呼吸，表示「固件在跑但没人在推数据」。
- *   进入呼吸前会等灯带渐灭走完：PWM 一开就不能再 show()，顺序不能反。
+ *   进入呼吸前会等逐颗熄灯走完：PWM 一开就不能再 show()，顺序不能反。
  * 灯带本身是 fail-safe 全灭：pixels 上电先 clear，CMD_BRIGHTNESS 也先 clear，
  *   任何「只恢复亮度」的帧都不会把关机前的旧颜色点亮。开机 / 待机 / 唤醒
  *   没人推 SET_ALL 时灯带一律是黑的，不依赖 Windows 在关机瞬间发 OFF。
@@ -59,7 +61,7 @@
  *
  * 保护机制：
  *   - 帧解析带超时重置，一串干扰字节不会把状态机卡死
- *   - 心跳超时(3s)后自动渐暗到灭：电脑关机/休眠/进程退出时不会僵在最后一帧
+ *   - 心跳超时(3s)后 1 秒内逐颗灭掉：电脑关机/休眠/进程退出时不会僵在最后一帧
  */
 
 #include <Adafruit_NeoPixel.h>
@@ -76,8 +78,10 @@
 #define MAX_PAYLOAD       192  // 60 颗 x 3B = 180B，留 12B 余量
 #define FRAME_TIMEOUT_MS  100
 #define HEARTBEAT_TIMEOUT 3000
-#define FADE_STEP_MS      60
-#define FADE_STEP         5
+// 失联熄灯：跟网页上那个「灭」开关一模一样 —— 一秒内从尾颗开始逐颗灭掉。
+// 60 颗 / 1000ms = 16.6ms 一颗，取整 16ms（60 x 16 = 960ms）。
+#define WIPE_OFF_MS       1000
+#define WIPE_OFF_STEP_MS  (WIPE_OFF_MS / LED_COUNT)
 
 #define CMD_SET_ALL    0x01
 #define CMD_BRIGHTNESS 0x03
@@ -120,11 +124,12 @@ uint8_t payloadIdx = 0;
 uint32_t lastByteMs = 0;
 uint32_t lastFrameMs = 0;
 
-// ---- 亮度与渐灭 ----
+// ---- 亮度与失联熄灯 ----
 uint8_t targetBrightness = 128;
 uint8_t currentLevel = 128;
-bool    fading = false;
-uint32_t lastFadeMs = 0;
+bool    fading = false;         // 主机失联，正在逐颗熄灯
+uint32_t fadeStartMs = 0;       // 逐颗熄灯的起点
+uint16_t fadeLit = 0;           // 当前还亮着的颗数（从 LED_COUNT 倒数到 0）
 
 // ---- 板载 LED ----
 uint8_t statusMode  = STATUS_OFF;   // 主机用 0x07 设定的常驻灯态
@@ -213,9 +218,9 @@ void pulseStep() {
 // 每轮 loop 调一次。优先级：主机失联(呼吸) > 事件脉冲 > 主机指定的常驻灯态
 void updateStatusLed() {
   if (statusAlarm()) {
-    // 灯带还在渐灭就先不接管：渐灭里有 show()，PWM 一开就会打断 WS2812 时序。
-    // 等它灭完再呼吸，视觉上也正好是「灯光缓缓熄灭 → 板载灯接手」的接力。
-    if (fading && currentLevel > 0) {
+    // 灯带还在逐颗灭就先不接管：灭的过程里有 show()，PWM 一开就会打断 WS2812 时序。
+    // 等它灭完再呼吸，视觉上也正好是「灯光逐颗熄掉 → 板载灯接手」的接力。
+    if (fading && fadeLit > 0) {
       statusLedWrite(false);
       return;
     }
@@ -285,9 +290,10 @@ void handleFrame(uint8_t cmd, const uint8_t *payload, uint8_t len) {
                                            payload[i * 3 + 1],
                                            payload[i * 3 + 2]));
       }
-      // 收到有效数据就从渐灭状态唤醒
+      // 收到有效数据就从熄灯状态唤醒（上面已经把 60 颗像素全部重设过了）
       if (fading) {
         fading = false;
+        fadeLit = LED_COUNT;      // 复位成「全亮」，下次失联重新从尾颗灭起
         currentLevel = targetBrightness;
         strip.setBrightness(currentLevel);
       }
@@ -301,7 +307,8 @@ void handleFrame(uint8_t cmd, const uint8_t *payload, uint8_t len) {
       // 硬限 50%：电脑端发 255 也只到 128，防止 60 颗灯带过流。
       // 只 clamp 这一处，不再叠加别的折扣，避免两道相乘把亮度压没。
       // ★ 亮度帧绝不能点亮旧数据：关机 / 待机时 USB 还有电、固件不重启，
-      //   渐灭只把 currentLevel 压到 0，pixels 里仍留着最后一帧颜色。
+      //   pixels 里可能还留着上一帧颜色（失联熄灯现在会把它们逐颗清成 0，
+      //   但主机被强杀、来不及走完 1 秒时仍可能剩下前几颗）。
       //   以前这里直接 setBrightness + show()，开机第一条 CMD_BRIGHTNESS
       //   就把关机前那颗灯原样复活了（「开机后中间莫名其妙亮一颗」的真凶）。
       //   先 clear 再 show：真正的颜色一律由紧随其后的 CMD_SET_ALL 给。
@@ -322,6 +329,7 @@ void handleFrame(uint8_t cmd, const uint8_t *payload, uint8_t len) {
       strip.show();
       currentLevel = 0;
       fading = false;
+      fadeLit = 0;
       // 「关灯」是整套关掉：板载 LED 一起灭，且之后停心跳也不进呼吸报警
       pulseStop();
       statusMode  = STATUS_OFF;
@@ -443,16 +451,23 @@ void loop() {
     resetParser();
   }
 
-  // 3) 心跳超时：电脑关机 / 休眠 / 进程退出时自动渐暗到灭
+  // 3) 心跳超时：电脑关机 / 休眠 / 进程退出时，1 秒内从尾颗开始逐颗灭掉，
+  //    跟网页上点「灭」开关完全同一个观感（尾 → 头，960ms 走完）。
   if (!fading && (millis() - lastFrameMs) > HEARTBEAT_TIMEOUT) {
     fading = true;
-    lastFadeMs = millis();
+    fadeStartMs = millis();
+    fadeLit = LED_COUNT;
   }
-  if (fading && currentLevel > 0 && (millis() - lastFadeMs) > FADE_STEP_MS) {
-    lastFadeMs = millis();
-    currentLevel = (currentLevel > FADE_STEP) ? (currentLevel - FADE_STEP) : 0;
-    strip.setBrightness(currentLevel);
-    strip.show();
+  if (fading) {
+    // 按经过的时间反推「该剩几颗」，而不是每轮递减一次：主循环偶尔被串口处理
+    // 拖慢时，下一次会自动补上漏掉的颗数，1 秒总时长不会被拉长。
+    uint32_t gone = (millis() - fadeStartMs) / WIPE_OFF_STEP_MS;
+    uint16_t lit = (gone >= LED_COUNT) ? 0 : (uint16_t)(LED_COUNT - gone);
+    if (lit < fadeLit) {
+      for (uint16_t i = lit; i < fadeLit; i++) strip.setPixelColor(i, 0, 0, 0);
+      fadeLit = lit;
+      strip.show();
+    }
   }
 
   // 4) 板载 LED：正常态由主机指定，主机失联转 4Hz 报警
