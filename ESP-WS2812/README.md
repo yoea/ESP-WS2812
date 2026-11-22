@@ -22,7 +22,6 @@
 | `host/idle_state.json` | 空闲模式 / 自定义颜色 / 各模式强度，面板改动即时写回，**不入库** |
 | `host/logs/` | 运行日志 + pid 文件，**不入库** |
 | `host/requirements.txt` | **当前**依赖清单（pyserial / Pillow / winrt-*），换 Python 后用它重装 |
-| `flash.ps1` | 旧版烧录脚本，已停用：板型参数过时，停/起服务还指向已删除的 `led_host.py`。烧录用 `flash_d1mini.ps1` |
 
 ## 硬件与链路
 
